@@ -216,4 +216,3 @@ design rather than continuing to chase a fix with diminishing returns.
 ## License
 
 MIT — see [LICENSE](LICENSE). Hack away.
-# tinyGS-Dashboard

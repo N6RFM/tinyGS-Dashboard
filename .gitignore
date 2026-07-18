@@ -1,0 +1,18 @@
+# Python virtual environment - recreated by install.sh, never committed
+venv/
+
+# Session output - logs, raw captures, and exported JSON frames are all
+# machine/session-specific and can get large; keep the folder itself
+# tracked (see logs/.gitkeep) but not its contents
+logs/*.log
+logs/*.bin
+logs/*.json
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Common editor/OS cruft
+.DS_Store
+.vscode/
+*.swp

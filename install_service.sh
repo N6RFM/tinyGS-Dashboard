@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install TinyGS Dashboard as a systemd service (auto-starts on boot,
-# auto-restarts if it crashes).
+# auto-restarts if it crashes). Run this with sudo: sudo bash install_service.sh
 # Code written by N6RFM with help from Claude AI
 #
 # IMPORTANT GOTCHA: Restart=always below means systemd will immediately
@@ -13,10 +13,36 @@
 # and remember it'll come back on next boot unless you also:
 #   sudo systemctl disable tinygs-dashboard
 
-USER_NAME=$(whoami)
+set -e
+
+# This script must be run with sudo, which means $HOME and `whoami` reflect
+# ROOT, not the person who typed the sudo command - using either directly
+# previously generated a service that ran as User=root out of /root/..., a
+# path that doesn't exist, causing a 203/EXEC failure at every start.
+# $SUDO_USER is set BY sudo itself to the original invoking user, so use that
+# instead (falling back to whoami only for the unusual case of actually being
+# logged in as root directly, not via sudo).
+USER_NAME="${SUDO_USER:-$(whoami)}"
+USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
+if [ -z "$USER_HOME" ]; then
+    echo "❌ Could not determine home directory for user '$USER_NAME'."
+    exit 1
+fi
+
 # Must match install.sh's PROJECT_DIR exactly - both are fixed at
-# $HOME/tinygs-dashboard regardless of where you run either script from.
-PROJECT_DIR="$HOME/tinygs-dashboard"
+# <home>/tinyGS-Dashboard (matching the GitHub repo's name/casing) regardless
+# of where you run either script from.
+PROJECT_DIR="$USER_HOME/tinyGS-Dashboard"
+
+# Sanity check before writing a service file that points nowhere useful.
+if [ ! -f "$PROJECT_DIR/venv/bin/python" ]; then
+    echo "❌ $PROJECT_DIR/venv/bin/python not found."
+    echo "   Run install.sh as $USER_NAME first (not with sudo) to create the venv, then re-run this script."
+    exit 1
+fi
+
+echo "📌 Installing service for user: $USER_NAME (home: $USER_HOME)"
+echo "📌 Project directory: $PROJECT_DIR"
 
 sudo tee /etc/systemd/system/tinygs-dashboard.service << EOF
 [Unit]

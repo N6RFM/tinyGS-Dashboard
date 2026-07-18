@@ -972,6 +972,15 @@ async def index_handler(request):
     // changes. See websocket_handler's docstring (server side) for the full
     // message protocol this listens for.
     let ws, currentFilter = 'all', lines = [], isConnected = false;
+    // Wall-clock anchor for the live uptime ticker (see the setInterval near
+    // the bottom of this script). Sever gives us `state.uptime` (seconds
+    // elapsed as of that message) only occasionally - on connect/disconnect
+    // and initial page load - not every second. Without ticking locally in
+    // between those messages, the uptime display would show a stale, frozen
+    // value the rest of the time. `uptimeAnchor` is the epoch-ms timestamp
+    // (client clock) corresponding to when the connection started, computed
+    // from the most recent state/status message; null while disconnected.
+    let uptimeAnchor = null;
     const terminal = document.getElementById('terminal');
     const btnConnect = document.getElementById('btnConnect');
     const btnClear = document.getElementById('btnClear');
@@ -1095,6 +1104,11 @@ async def index_handler(request):
       document.getElementById('mBytes').textContent = formatBytes(state.totalBytes);
       document.getElementById('mJson').textContent = (state.jsonFramesCount ?? (state.jsonFrames ? state.jsonFrames.length : 0)).toLocaleString();
       document.getElementById('mUptime').textContent = formatUptime(state.uptime);
+
+      // Re-derive the anchor every time we get a fresh reading from the
+      // server, so the local ticker (below) stays in sync and self-corrects
+      // for any client/server clock drift rather than accumulating error.
+      uptimeAnchor = state.connected ? (Date.now() - state.uptime * 1000) : null;
       document.getElementById('portInfo').textContent = state.connected ? 'Streaming...' : 'No port selected';
       document.getElementById('termTitle').textContent = state.connected ? 'serial://active @ 115200' : 'serial://waiting';
 
@@ -1208,6 +1222,15 @@ async def index_handler(request):
     function escapeHtml(t) {
       return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
+
+    // Ticks the UPTIME display once a second using uptimeAnchor (set in
+    // updateStatusUI), so it behaves like an actual live timer instead of
+    // only updating whenever a status/state message happens to arrive.
+    setInterval(() => {
+      if (uptimeAnchor !== null) {
+        document.getElementById('mUptime').textContent = formatUptime((Date.now() - uptimeAnchor) / 1000);
+      }
+    }, 1000);
 
     connectWS();
   </script>

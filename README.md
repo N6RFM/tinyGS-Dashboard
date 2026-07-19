@@ -18,7 +18,7 @@ A live web dashboard for monitoring TinyGS ESP32 ground station serial output on
 
 ```bash
 # 1. Get the code: either
-#      git clone <this-repo-url> && cd tinygs-dashboard
+#      git clone <this-repo-url> && cd tinyGS-Dashboard
 #    or download/extract the zip and open a terminal in that folder
 # 2. Run the installer
 bash install.sh
@@ -29,10 +29,10 @@ bash install.sh
 
 # 4. Plug in your ESP32
 
-# 5. Start the server - NOTE: always run this from ~/tinygs-dashboard,
+# 5. Start the server - NOTE: always run this from ~/tinyGS-Dashboard,
 #    NOT from wherever you cloned/extracted the repo. See "Where things
 #    live" below.
-cd ~/tinygs-dashboard
+cd ~/tinyGS-Dashboard
 source venv/bin/activate
 python3 tinygs_server.py
 
@@ -41,11 +41,11 @@ python3 tinygs_server.py
 
 ## Where things live (read this if anything seems missing)
 
-`install.sh` always installs to **`~/tinygs-dashboard`**, regardless of what
+`install.sh` always installs to **`~/tinyGS-Dashboard`**, regardless of what
 folder you cloned or extracted the code into or what you renamed it to. If
 you cloned to, say, `~/TinyGS_Serial_Dashboard` and later can't find the
 venv or the server won't start from that folder - that's why. Everything
-(venv, logs, the server script) actually lives in `~/tinygs-dashboard`.
+(venv, logs, the server script) actually lives in `~/tinyGS-Dashboard`.
 Always `cd` there before running anything manually.
 
 ## Auto-Start on Boot
@@ -69,7 +69,7 @@ since two processes end up fighting over the same serial port.
 
 ## Log Files
 
-Every session creates **two** files in `~/tinygs-dashboard/logs/`, named with
+Every session creates **two** files in `~/tinyGS-Dashboard/logs/`, named with
 a UTC timestamp:
 
 | File | Contents |
@@ -102,7 +102,8 @@ USB/serial transport itself), and no change to this codebase can fix that.
 
 Exported JSON telemetry (via the "Export JSON" button) is saved separately as
 `frames_YYYYMMDDTHHMMSSZ.json`, with each frame's `_receivedAt` field also in
-UTC.
+UTC, and a `_source` field (`"serial"` or `"wifi"`) noting which connection
+it came from - see "WiFi Console" below.
 
 Browse and view any of these files without leaving the browser via the 📂
 **Logs** button in the dashboard toolbar.
@@ -110,7 +111,7 @@ Browse and view any of these files without leaving the browser via the 📂
 ## File Layout
 
 ```
-~/tinygs-dashboard/
+~/tinyGS-Dashboard/
 ├── tinygs_server.py      # Main server (single file: backend + inline HTML/JS/CSS frontend)
 ├── requirements.txt      # Python dependencies
 ├── venv/                 # Python virtual environment (created by install.sh, gitignored)
@@ -133,9 +134,46 @@ Browse and view any of these files without leaving the browser via the 📂
 | **Live meters** | Frame count, bytes, JSON objects, uptime |
 | **Filters** | View All / JSON / TX / RX / Errors only |
 | **📂 Logs** | Browse and view any saved log file (processed or raw) without leaving the browser |
+| **🌐 WiFi Console** | Polls the ESP32's own local web dashboard over WiFi for guaranteed-complete console text (bypasses the USB serial buffer limit entirely - see below) |
 | **Export JSON** | Download all parsed telemetry frames as `.json` |
 | **Clear** | Reset terminal and counters |
 | **Dark theme** | Easy on the eyes for long monitoring sessions |
+
+## WiFi Console
+
+USB serial has a hard limitation: the ESP32's own internal Serial transmit
+buffer is fixed-size (256 bytes by default), and a high-volume burst (a full
+packet hex dump) can exceed it - when that happens, the firmware itself
+gracefully truncates its console output with `...` (see "Known/Accepted
+Behavior" below). **No actual satellite data is lost when this happens** -
+the full packet is captured and sent to the TinyGS network via MQTT
+regardless - but the local text preview can be incomplete.
+
+The **🌐 WiFi Console** button polls your ESP32's own local web dashboard
+(the same page you'd visit in a browser at its IP address) over WiFi,
+reading its complete, untruncated internal log buffer directly - the same
+data source that page's own live console uses. This is independent of the
+USB serial connection; run either one alone, or both together.
+
+To use it: find your ESP32's local IP (shown on its own web dashboard page,
+or check your router), click **🌐 WiFi Console**, enter the IP and your
+device's **admin/AP password** (the same one you use to log into its web
+config panel), click **Start Polling**.
+
+The password is required, not optional - confirmed directly from the
+firmware source (`ConfigManager.cpp`: `handleRefreshConsole()` calls
+`server.authenticate(...)` and rejects the request entirely if it fails).
+Without it, every poll attempt is silently rejected by the device and no
+data ever comes through - if you forget it, the WiFi Console panel will
+show a 🟡 status with a specific `HTTP 401` error instead of the normal 🟢,
+so it's visible rather than silently doing nothing.
+
+**Telling sources apart:** lines from the WiFi poller are tagged with a
+cyan **🌐 WiFi** marker in the terminal; USB serial lines have no tag. This
+distinction also carries through to exported JSON telemetry - every frame
+in `frames_*.json` has a `_source` field (`"serial"` or `"wifi"`) so you can
+tell, even after the fact, which connection a given decoded packet came
+through.
 
 ## Known/Accepted Behavior
 
@@ -149,6 +187,23 @@ EN from the USB-serial chip's control lines) or firmware changes. If it
 doesn't bother your workflow, no action needed; this has been left as-is by
 design rather than continuing to chase a fix with diminishing returns.
 
+**Long hex-dump lines sometimes show `...` or are missing entirely, and a
+"⚠ preview truncated" badge appears next to them.** This is confirmed,
+directly from the TinyGS firmware source, to be the ESP32 itself gracefully
+truncating its own serial console output when a burst of data (a full
+packet dump) doesn't fit in its fixed-size internal Serial buffer at the
+current baud rate - see `Log::AddLog()` in the firmware's `Logger.cpp`. It
+is **not** a bug in this dashboard, and it is **not** fixable from this
+codebase - none of DTR/RTS handling, serial port settings, or read-loop
+speed can influence it, since it's governed purely by the ESP32's own
+internal buffer state, not by anything the receiving side does.
+
+**Most importantly: no actual satellite data is lost.** The truncation only
+affects the human-readable console preview. The full, untruncated packet
+bytes are captured and uploaded to the TinyGS network via MQTT completely
+independently of this console-printing code path - your station's data on
+tinygs.com is complete regardless of what the local serial console shows.
+
 ## Troubleshooting
 
 **"No serial ports found"**
@@ -160,7 +215,7 @@ design rather than continuing to chase a fix with diminishing returns.
 - Same fix: add to `dialout` group, log out/in
 
 **venv missing / "No such file or directory: venv/bin/activate"**
-- You're almost certainly not in `~/tinygs-dashboard`. See "Where things live" above.
+- You're almost certainly not in `~/tinyGS-Dashboard`. See "Where things live" above.
 
 **"address already in use" on port 5000**
 - Something's already listening. Find it: `sudo lsof -i :5000`
@@ -199,12 +254,14 @@ design rather than continuing to chase a fix with diminishing returns.
 - Try a different USB port (avoid low-power hubs/front-panel headers)
 
 **Data looks truncated / incomplete in the log**
-- Compare `raw_*.bin` against `stream_*.log` for the same session - see "Log
-  Files" above for how to interpret the comparison.
+- See "Known/Accepted Behavior" above - this is expected ESP32 firmware
+  behavior, not data loss. The `raw_*.bin` capture (see "Log Files" above)
+  will show the same truncation, since it's present in the bytes the
+  firmware actually sent, not introduced by this dashboard.
 
 **Service won't start**
 - Check: `sudo journalctl -u tinygs-dashboard -f`
-- Make sure venv exists: `ls ~/tinygs-dashboard/venv/bin/python`
+- Make sure venv exists: `ls ~/tinyGS-Dashboard/venv/bin/python`
 
 ## Requirements
 

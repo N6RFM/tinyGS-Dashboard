@@ -236,7 +236,16 @@ class TinyGSServer:
         self.connected = False
         self.ser = None
         self.clients = set()
-        self.start_time = None
+        self.start_time = None  # serial-specific connect time, kept for compatibility
+        # UPTIME/session-time display needs a start time that's active
+        # whenever EITHER connection type is running, not just serial - the
+        # original design only ever set self.start_time from
+        # connect_serial()/disconnect_serial(), so UPTIME stayed frozen at
+        # 00:00:00 for anyone using WiFi Console without a serial
+        # connection, despite a real session genuinely being active. See
+        # _refresh_session_start_time(), called from all four
+        # connect/disconnect/start/stop methods.
+        self.session_start_time = None
         self._lock = threading.Lock()
         self.loop = None  # set once the asyncio event loop is running (see on_startup)
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -307,6 +316,23 @@ class TinyGSServer:
         # matching "failed" message having been shown first.
         self.wifi_console_error_logged = False
         self._wifi_console_task = None
+
+    def _refresh_session_start_time(self):
+        """Keeps self.session_start_time in sync with whether EITHER
+        connection type (serial or WiFi Console) is currently active. Call
+        this after any change to self.connected or self.wifi_console_enabled.
+        Sets it on the transition from "nothing active" to "something
+        active" (first connection of a session), and clears it once BOTH
+        are inactive (session fully ended) - so reconnecting later starts a
+        fresh UPTIME count rather than continuing a stale one. If one
+        connection type is already active when the other one starts, the
+        original start time is preserved (the session started when the
+        FIRST connection came up, not when a second one joined)."""
+        any_active = self.connected or self.wifi_console_enabled
+        if any_active and self.session_start_time is None:
+            self.session_start_time = datetime.datetime.now()
+        elif not any_active:
+            self.session_start_time = None
 
     def log(self, text, line_type="normal", source="serial"):
         """Record one logical line of output (or an internal event like
@@ -472,6 +498,7 @@ class TinyGSServer:
             except serial.SerialException as e:
                 self.log(f"Serial error: {e}", "error")
                 self.connected = False
+                self._refresh_session_start_time()
                 if self.ser:
                     try: self.ser.close()
                     except: pass
@@ -559,6 +586,7 @@ class TinyGSServer:
 
             self.connected = True
             self.start_time = datetime.datetime.now()
+            self._refresh_session_start_time()
             self.log(f"Connected to {port} @ {BAUD_RATE} baud", "success")
 
             # Diagnostic: log the actual read-back modem control line state.
@@ -598,6 +626,7 @@ class TinyGSServer:
         useful to do about them). serial_reader() notices self.connected is
         False on its next loop iteration and idles until reconnected."""
         self.connected = False
+        self._refresh_session_start_time()
         if self.ser:
             try: self.ser.close()
             except: pass
@@ -640,6 +669,7 @@ class TinyGSServer:
         self.wifi_console_last_id = "0"
         self.wifi_console_lines_received = 0
         self.wifi_console_enabled = True
+        self._refresh_session_start_time()
         self._wifi_console_task = asyncio.create_task(self._wifi_console_poll_loop())
         _save_config({
             "wifi_console_ip": ip,
@@ -660,6 +690,7 @@ class TinyGSServer:
         only the "was running" flag is cleared, so a restart won't
         auto-resume a session you deliberately stopped."""
         self.wifi_console_enabled = False
+        self._refresh_session_start_time()
         if self._wifi_console_task:
             self._wifi_console_task.cancel()
             self._wifi_console_task = None
@@ -780,7 +811,7 @@ class TinyGSServer:
                 "lines": list(self.lines),
                 "jsonFrames": self.json_frames,
                 "totalBytes": self.total_bytes,
-                "uptime": (datetime.datetime.now() - self.start_time).total_seconds() if self.start_time else 0,
+                "uptime": (datetime.datetime.now() - self.session_start_time).total_seconds() if self.session_start_time else 0,
                 "ports": [p.device for p in serial.tools.list_ports.comports()],
                 "logDir": LOG_DIR,
                 "wifiConsoleEnabled": self.wifi_console_enabled,
@@ -803,7 +834,7 @@ class TinyGSServer:
                 "connected": self.connected,
                 "jsonFramesCount": len(self.json_frames),
                 "totalBytes": self.total_bytes,
-                "uptime": (datetime.datetime.now() - self.start_time).total_seconds() if self.start_time else 0,
+                "uptime": (datetime.datetime.now() - self.session_start_time).total_seconds() if self.session_start_time else 0,
                 "ports": [p.device for p in serial.tools.list_ports.comports()],
                 "logDir": LOG_DIR,
                 "wifiConsoleEnabled": self.wifi_console_enabled,
@@ -1717,7 +1748,13 @@ async def index_handler(request):
       // Re-derive the anchor every time we get a fresh reading from the
       // server, so the local ticker (below) stays in sync and self-corrects
       // for any client/server clock drift rather than accumulating error.
-      uptimeAnchor = state.connected ? (Date.now() - state.uptime * 1000) : null;
+      // A session is "active" for UPTIME purposes if EITHER serial OR WiFi
+      // Console is connected - originally this only checked state.connected
+      // (serial), so UPTIME stayed frozen at 00:00:00 for anyone running
+      // WiFi Console without a serial connection, despite a real session
+      // genuinely being active server-side (see session_start_time).
+      const sessionActive = state.connected || state.wifiConsoleEnabled;
+      uptimeAnchor = sessionActive ? (Date.now() - state.uptime * 1000) : null;
       document.getElementById('portInfo').textContent = state.connected ? 'Streaming...' : 'No port selected';
       document.getElementById('termTitle').textContent = state.connected ? 'serial://active @ 115200' : 'serial://waiting';
 

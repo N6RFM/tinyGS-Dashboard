@@ -46,6 +46,36 @@ Notable bugs fixed during development (kept here so the reasoning isn't lost):
     any decoding/line-splitting, so truncation/data-loss questions can be
     debugged by comparing it against the processed stream_*.log without
     needing a second program (e.g. picocom) fighting over the same port.
+
+RESOLVED (diagnostically) - console hex-dump truncation:
+  Long hex-dump lines from the ESP32 sometimes arrive already truncated with
+  a literal "..." (or missing entirely). Root cause confirmed directly from
+  the TinyGS firmware source (Logger.cpp, Log::AddLog()): before writing
+  each queued log line, the firmware checks Serial.availableForWrite() - the
+  free space in its own fixed-size (256 byte, ESP32 Arduino default) UART TX
+  buffer. A single packet burst (RSSI/SNR/freq line + header + separators +
+  up to 4 hex-dump lines) is ~400-500+ bytes queued in rapid succession by
+  an async logger task; at 115200 baud that physically takes time to drain,
+  and the fixed buffer can't hold it all. When a line doesn't fully fit, the
+  firmware writes what it can and appends "..." (or, if there's no room at
+  all, skips the line entirely and silently - explaining lines that were
+  fully absent rather than truncated).
+
+  This is deliberate firmware behavior, gated purely by the ESP32's own
+  internal buffer state vs. its fixed UART baud rate - NOT by anything the
+  receiving/reading side does. Confirmed NOT fixable from this codebase:
+  none of DTR/RTS handling, HUPCL, or read-loop speed can influence it,
+  since (absent hardware RTS/CTS flow control, which this board doesn't
+  have wired - see the "Line state after open" diagnostic in
+  connect_serial()) nothing downstream can signal backpressure to the
+  firmware's UART peripheral at all.
+
+  IMPORTANT: this only affects the human-readable CONSOLE PREVIEW. The full,
+  untruncated packet bytes are captured and sent to the TinyGS MQTT network
+  completely independently (see Radio.cpp: MQTT_Client::queueRx() uses the
+  full respFrame, never the truncated console text) - no actual satellite
+  data is lost, ever, regardless of what the local serial console shows.
+  See TERMINAL_TRUNCATION_NOTE below for how the frontend surfaces this.
 """
 
 import serial
@@ -54,10 +84,75 @@ import asyncio
 import json
 import datetime
 import os
+import re
+import subprocess
 import threading
 import time
 from collections import deque
 from aiohttp import web, WSMsgType
+import aiohttp
+
+# Matches the TinyGS firmware's own truncation marker: Log::AddLog() in the
+# firmware (Logger.cpp) appends a literal "..." when a line doesn't fully
+# fit in the ESP32's fixed-size Serial TX buffer during a high-volume burst
+# (see the module docstring's "RESOLVED (diagnostically)" section below for
+# the full explanation).
+TRUNCATION_MARKER_RE = re.compile(r'\.\.\.$')
+
+# Known firmware strings that legitimately end in "..." as decoration, NOT
+# as a truncation marker. Found by grepping the ENTIRE firmware source tree
+# for every literal "..." in a Log::console/error/info/debug/*Async() call
+# (see tinyGS/src/Radio/Radio.cpp, Mqtt/MQTT_Client.cpp,
+# ConfigManager/ConfigManager.cpp, OTA/OTA.cpp, Improv/tinygs_improv.cpp) -
+# not just excluding phrases one at a time as they're encountered, which
+# missed several of these the first time around.
+_KNOWN_NON_TRUNCATION_SUFFIXES = (
+    "Initializing ...",                        # Radio.cpp - SX12xx radio init
+    "Enable TCXO 33...",                       # Radio.cpp - SX1276 TCXO enable
+    "Processing AX.25 frame...",                # Radio.cpp - AX.25 frame processing
+    "Attempting MQTT connection...",            # MQTT_Client.cpp
+    "Restarting...",                            # MQTT_Client.cpp - after repeated MQTT failures
+    "retrying...",                              # MQTT_Client.cpp - MQTT timeout retry
+    "Automatic board detection running...",     # ConfigManager.cpp
+    "Checking for firmware Updates...",         # OTA.cpp
+    "Failed to connect to wifi...",             # Improv/tinygs_improv.cpp
+)
+
+
+def _is_truncated(text):
+    """Best-effort UI hint: does this line look like it was cut short by
+    the firmware's Serial TX buffer limit (see Log::AddLog() in the
+    firmware's Logger.cpp)? Not authoritative, not used for any
+    data-integrity decision - only affects a cosmetic badge in the UI.
+
+    A naive "ends with ...' check has a real false-positive case, seen in
+    practice: a COMPLETE, full hex-dump data line from Log::log_packet()
+    can legitimately end in "..." if its last 1-3 bytes happen to be
+    non-printable - the firmware renders every non-printable byte as a
+    literal '.' in the ASCII column (log_packet(): `sprintf(ascii+k, "%c",
+    0x2E)`), so "the last few characters are periods" can mean either
+    "genuinely truncated" or "these particular bytes just don't print".
+
+    The distinguishing structural fact (from the same source): a complete
+    line's hex portion and ASCII portion are always separated by a double
+    space (each hex byte is formatted as "XX ", and log_packet() joins the
+    two halves with another literal space: `"%s %s"` - see log_packet() in
+    Logger.cpp), and the ASCII portion is always exactly bytes_per_line=16
+    characters wide (padded if the packet's last line is short). A genuine
+    truncation, by contrast, cuts raw bytes via Serial.write() with no
+    awareness of that structure - it's very unlikely to coincidentally land
+    exactly at "double-space followed by <=16 characters" the way a real,
+    complete ASCII column does. So: if the text after the LAST double-space
+    is 16 characters or fewer, treat it as a complete line whose ASCII
+    column just happens to end in dots, not a truncation."""
+    if not TRUNCATION_MARKER_RE.search(text):
+        return False
+    if text.rstrip().endswith(_KNOWN_NON_TRUNCATION_SUFFIXES):
+        return False
+    idx = text.rfind('  ')  # last double-space = the hex/ASCII column separator, if present
+    if idx != -1 and len(text[idx + 2:]) <= 16:
+        return False
+    return True
 
 
 # ============ CONFIG ============
@@ -65,7 +160,67 @@ SERIAL_PORT = None      # Auto-detect if None
 BAUD_RATE = 115200
 MAX_LINES = 2000        # in-memory + browser-side line history cap (see deque below)
 LOG_DIR = os.path.expanduser("~/tinygs-dashboard/logs")
+CONFIG_FILE = os.path.expanduser("~/tinygs-dashboard/config.json")
 # ================================
+
+
+def _get_git_version():
+    """Best-effort short git commit hash of the running server code, shown
+    in the UI and startup banner so it's always possible to tell exactly
+    which build is actually live - useful after a `git pull` + restart, or
+    when troubleshooting "is my fix actually deployed?" (a real recurring
+    point of confusion during development). Appends "-dirty" if there are
+    uncommitted local changes. Falls back to "unknown" if this isn't running
+    from a git checkout, or git isn't installed - never fatal."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=script_dir, stderr=subprocess.DEVNULL, timeout=2
+        ).decode().strip()
+        is_dirty = subprocess.call(
+            ["git", "diff", "--quiet"],
+            cwd=script_dir, stderr=subprocess.DEVNULL
+        ) != 0
+        return commit + ("-dirty" if is_dirty else "")
+    except Exception:
+        return "unknown"
+
+
+GIT_VERSION = _get_git_version()
+
+
+def _load_config():
+    """Best-effort load of the persisted config file (currently just WiFi
+    Console settings). Returns {} on any error (missing file, corrupt JSON,
+    permissions issue) - this is a convenience feature, never something that
+    should prevent the server from starting."""
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_config(config):
+    """Best-effort save of the config file, with restrictive permissions
+    (owner read/write only) since it can contain a plaintext password.
+
+    SECURITY NOTE: this password is stored in plaintext on disk, protected
+    only by OS file permissions (chmod 600) - not encrypted. That's an
+    explicit, documented tradeoff for convenience (avoiding re-entering it
+    after every restart/upgrade) on what's assumed to be a personal,
+    single-user machine. If that assumption doesn't hold for your setup,
+    don't rely on this - the file lives at CONFIG_FILE (~/tinygs-dashboard/
+    config.json) and can be deleted/edited manually, or this feature simply
+    not used (re-enter the password each session instead)."""
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f)
+        os.chmod(CONFIG_FILE, 0o600)
+    except Exception:
+        pass  # convenience feature only - never fatal if this fails
+
 
 
 class TinyGSServer:
@@ -113,12 +268,61 @@ class TinyGSServer:
         self._raw_file = os.path.join(LOG_DIR, f"raw_{_file_ts}.bin")
         self._raw_fh = open(self._raw_file, "ab", buffering=0)  # unbuffered binary
 
-    def log(self, text, line_type="normal"):
-        """Record one logical line of serial output (or an internal event
-        like "Connected to ..."). This is the single choke point for: updating
+        # WiFi console polling: a SECOND, independent data source that reads
+        # the ESP32's own local web dashboard log endpoint (GET /cs?c2=<id>)
+        # over WiFi instead of USB serial. This reads from the firmware's
+        # complete, untruncated internal log buffer (Log::AddLog()/getLog()
+        # in Logger.cpp) - it is NOT subject to the 256-byte Serial TX buffer
+        # limit that causes the "..." truncation on the USB serial path (see
+        # the module docstring's "RESOLVED (diagnostically)" section). This
+        # is genuinely independent of connect_serial()/disconnect_serial()
+        # (works purely over WiFi) and is off by default - enabled via the
+        # "🌐 WiFi Console" control in the UI once you know your board's
+        # local IP (shown on its own web dashboard page).
+        #
+        # Credentials persist across restarts via CONFIG_FILE (see
+        # _load_config/_save_config above) - loaded here as defaults so a
+        # server restart/upgrade doesn't require re-entering the IP/password
+        # in the browser every time. If polling was active when the server
+        # last stopped (was_enabled), on_startup() below resumes it
+        # automatically with no browser interaction needed at all.
+        _saved = _load_config()
+        self.wifi_console_enabled = False
+        self.wifi_console_ip = _saved.get("wifi_console_ip")
+        self.wifi_console_password = _saved.get("wifi_console_password", "")
+        self._wifi_console_should_resume = bool(_saved.get("wifi_console_was_enabled"))
+        self.wifi_console_last_id = "0"
+        self.wifi_console_lines_received = 0
+        self.wifi_console_last_error = None
+        self.wifi_console_consecutive_errors = 0
+        # Tracks whether a "poll failed" warning was actually logged for the
+        # CURRENT failure streak - isolated single-attempt blips (WiFi jitter,
+        # the embedded server being briefly busy) are extremely common over
+        # many hours of continuous polling and self-heal within one retry;
+        # logging every one of them just adds noise for something that costs
+        # no data (the position tracker only advances on success, so a
+        # failed poll never skips content). Only sustained failure streaks
+        # get logged - see the threshold in _wifi_console_poll_loop(). This
+        # flag makes sure a "recovered" message never appears without a
+        # matching "failed" message having been shown first.
+        self.wifi_console_error_logged = False
+        self._wifi_console_task = None
+
+    def log(self, text, line_type="normal", source="serial"):
+        """Record one logical line of output (or an internal event like
+        "Connected to ..."). This is the single choke point for: updating
         in-memory state, extracting JSON telemetry frames, writing to the
         on-disk stream log, and broadcasting to connected browsers. Safe to
         call from any thread (see the run_coroutine_threadsafe note below).
+
+        `source` is "serial" (default, USB serial) or "wifi" (WiFi console
+        poller - see _wifi_console_poll_loop). This is tracked all the way
+        through to exported JSON frames (`_source` field) as well as the
+        live UI, since decoded telemetry could otherwise come from either
+        path with no way to tell which - important given the two paths have
+        different completeness guarantees (see the module docstring's
+        "RESOLVED (diagnostically)" section on why WiFi-sourced data is
+        never subject to the USB serial buffer's truncation).
 
         Timestamps: entry['time'] stays local-time-only (HH:MM:SS.mmm) since
         that's what's shown in the live browser terminal, which is more
@@ -139,6 +343,11 @@ class TinyGSServer:
             "type": line_type,
             "time": now_local.strftime("%H:%M:%S.%f")[:-3],  # local time, for the live browser display only
             "timestamp": now_utc.isoformat(),                 # UTC, unambiguous - used for everything persisted
+            "source": source,                                  # "serial" or "wifi" - see docstring above
+            # Best-effort UI hint (not authoritative) - see _is_truncated().
+            # Kept separate from `type` so it doesn't change which All/JSON/
+            # TX/RX/Errors filter chip a line shows up under.
+            "truncated": _is_truncated(text),
         }
 
         with self._lock:
@@ -154,6 +363,7 @@ class TinyGSServer:
                         obj = json.loads(text[start:end])
                         obj["_receivedAt"] = now_utc.isoformat()
                         obj["_raw"] = text
+                        obj["_source"] = source
                         self.json_frames.append(obj)
                 except:
                     pass
@@ -214,7 +424,20 @@ class TinyGSServer:
                 continue
 
             try:
-                data = self.ser.read(self.ser.in_waiting or 1)
+                # Request a generous chunk rather than exactly `in_waiting`.
+                # Under VMIN=0 semantics this doesn't add latency (read()
+                # returns immediately with whatever's currently available,
+                # never blocks waiting to fill the requested size) - it just
+                # means that during a burst, we do fewer, larger read() calls
+                # instead of many tiny ones, each of which costs a Python
+                # function-call/syscall round trip. This matters because the
+                # current best lead on the console hex-dump truncation issue
+                # is USB-level backpressure: if this host doesn't drain
+                # incoming bytes fast enough, that can propagate back through
+                # the USB-serial bridge to the ESP32's own UART peripheral,
+                # competing with its async console logger - see the module
+                # docstring's "KNOWN UNRESOLVED ISSUE" section.
+                data = self.ser.read(max(self.ser.in_waiting, 4096))
                 if not data:
                     continue
 
@@ -225,23 +448,26 @@ class TinyGSServer:
                     pass
 
                 text = data.decode('utf-8', errors='replace')
-                buffer += text
+                # Normalize line endings ONCE per read chunk, not once per
+                # extracted line. The previous version ran this full-buffer
+                # replace() call inside the line-extraction loop below, so a
+                # single read containing N complete lines re-scanned and
+                # rebuilt the (shrinking, but still substantial) buffer N
+                # times instead of once - real, avoidable overhead on every
+                # multi-line burst, which is exactly when it matters most.
+                buffer += text.replace('\r\n', '\n').replace('\r', '\n')
 
                 # Split whatever we've accumulated into complete lines. A
                 # line only gets logged once we've actually seen its
                 # terminator; anything left over (no \n yet) stays in
                 # `buffer` and gets prepended to on the next read.
-                while '\n' in buffer or '\r' in buffer:
-                    buffer = buffer.replace('\r\n', '\n').replace('\r', '\n')
+                while '\n' in buffer:
                     idx = buffer.find('\n')
-                    if idx >= 0:
-                        line = buffer[:idx].strip()
-                        buffer = buffer[idx+1:]
-                        if line:
-                            line_type = self._detect_type(line)
-                            self.log(line, line_type)
-                    else:
-                        break
+                    line = buffer[:idx].strip()
+                    buffer = buffer[idx+1:]
+                    if line:
+                        line_type = self._detect_type(line)
+                        self.log(line, line_type)
 
             except serial.SerialException as e:
                 self.log(f"Serial error: {e}", "error")
@@ -314,9 +540,54 @@ class TinyGSServer:
             self.ser.dtr = False
             self.ser.rts = False
             self.ser.open()
+
+            # NOTE: an earlier version of this code also cleared HUPCL here,
+            # on the theory that Linux dropping DTR-on-close was contributing
+            # to the reset/truncation issues. A direct `stty -F <port> -a`
+            # comparison against a known-working picocom connection proved
+            # that theory backwards: picocom's actual working connection has
+            # HUPCL *ON*, not off. That patch was reverted rather than left
+            # in place based on a theory its own test data contradicted. The
+            # rest of this comparison came back with every other termios
+            # setting identical between picocom and pyserial (raw mode, flow
+            # control, parity - all the same) - so the OS-level line
+            # discipline is very likely NOT the source of the reset/
+            # truncation behavior. See the module docstring / commit history
+            # for the fuller chain of reasoning; the remaining suspects are
+            # things `stty -a` can't show at all, like actual DTR/RTS/CTS
+            # signal-line state at specific moments.
+
             self.connected = True
             self.start_time = datetime.datetime.now()
             self.log(f"Connected to {port} @ {BAUD_RATE} baud", "success")
+
+            # Diagnostic: log the actual read-back modem control line state.
+            # `stty -a` cannot show this at all (it only reports termios line
+            # discipline settings, which a side-by-side comparison against a
+            # known-working picocom connection showed were already identical
+            # apart from HUPCL/VMIN, neither of which turned out to matter -
+            # see the comment above). This is the next real lead: if this
+            # ever gets compared against picocom's actual line state at the
+            # same moment, whatever differs here is the remaining suspect.
+            #
+            # Each line is read individually (not one big try/except) because
+            # not every property is supported on every backend/adapter - e.g.
+            # RI/CD often aren't wired on cheap USB-serial adapters and raise
+            # OSError when read. A single unsupported property shouldn't
+            # silently drop every other value along with it.
+            def _read_line_state(attr):
+                try:
+                    return str(getattr(self.ser, attr))
+                except Exception as e:
+                    return f"n/a ({type(e).__name__})"
+
+            line_state = ", ".join(
+                f"{name}={_read_line_state(attr)}"
+                for name, attr in [("DTR", "dtr"), ("RTS", "rts"), ("CTS", "cts"),
+                                    ("DSR", "dsr"), ("RI", "ri"), ("CD", "cd")]
+            )
+            self.log(f"Line state after open: {line_state}", "normal")
+
             return {"ok": True, "port": port, "baud": BAUD_RATE}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -335,6 +606,169 @@ class TinyGSServer:
         self.start_time = None
         return {"ok": True}
 
+    async def start_wifi_console(self, ip, password=""):
+        """Start polling the ESP32's local web dashboard for complete,
+        untruncated console text over WiFi - see the WiFi console polling
+        comment in __init__ for why this exists. Independent of the USB
+        serial connection; can run with or without it connected.
+
+        `password` is your device's AP/admin password - confirmed directly
+        from the firmware source (ConfigManager.cpp: handleRefreshConsole())
+        that this endpoint requires HTTP Basic Auth with username "admin"
+        (IOTWEBCONF_ADMIN_USER_NAME, hardcoded in IotWebConf2.h) and that
+        same password, whenever the device is in its normal online state.
+        Without it, every poll request gets rejected and nothing ever comes
+        through - this was the actual cause of "0 lines received" with no
+        visible error before this was added.
+
+        If `ip`/`password` are omitted (empty), falls back to whatever was
+        previously saved to CONFIG_FILE (or used earlier this session) -
+        lets the browser resubmit with just an empty password field after a
+        restart, rather than forcing full re-entry every time. On success,
+        the working credentials are persisted to disk (see _save_config)."""
+        if self.wifi_console_enabled:
+            return {"ok": False, "error": "WiFi console is already running"}
+        ip = (ip or "").strip() or (self.wifi_console_ip or "")
+        password = password or self.wifi_console_password or ""
+        if not ip:
+            return {"ok": False, "error": "ESP32 IP address is required"}
+        if not password:
+            return {"ok": False, "error": "Admin/AP password is required"}
+
+        self.wifi_console_ip = ip
+        self.wifi_console_password = password
+        self.wifi_console_last_id = "0"
+        self.wifi_console_lines_received = 0
+        self.wifi_console_enabled = True
+        self._wifi_console_task = asyncio.create_task(self._wifi_console_poll_loop())
+        _save_config({
+            "wifi_console_ip": ip,
+            "wifi_console_password": password,
+            "wifi_console_was_enabled": True,
+        })
+        self.log(
+            f"WiFi console polling started ({ip}) - lines from this source "
+            f"are tagged [WiFi] and are NOT subject to the USB serial "
+            f"buffer limit, so hex dumps via this path are always complete.",
+            "success"
+        )
+        return {"ok": True, "ip": ip}
+
+    async def stop_wifi_console(self):
+        """Stop WiFi console polling. Always succeeds. Credentials stay
+        saved to disk (so they're still pre-filled/reusable next time) -
+        only the "was running" flag is cleared, so a restart won't
+        auto-resume a session you deliberately stopped."""
+        self.wifi_console_enabled = False
+        if self._wifi_console_task:
+            self._wifi_console_task.cancel()
+            self._wifi_console_task = None
+        _save_config({
+            "wifi_console_ip": self.wifi_console_ip,
+            "wifi_console_password": self.wifi_console_password,
+            "wifi_console_was_enabled": False,
+        })
+        self.log("WiFi console polling stopped", "normal")
+        return {"ok": True}
+
+    async def _wifi_console_poll_loop(self):
+        """Repeatedly GET /cs?c2=<id> from the ESP32's local web dashboard,
+        matching the same protocol its own JS page uses (see the id-passing
+        scheme: response is "<next_id>\\n<any new text since last id>").
+        Runs as an asyncio task (not a thread) since this is pure async I/O
+        via aiohttp's client session - no blocking calls involved.
+
+        Sends HTTP Basic Auth (admin / self.wifi_console_password) on every
+        request - confirmed required by the actual firmware source
+        (handleRefreshConsole() in ConfigManager.cpp calls
+        server.authenticate(...) and, on failure, server.requestAuthentication()
+        then returns immediately with no content). This was missing entirely
+        in the original version of this feature.
+
+        Failures are tracked (self.wifi_console_last_error /
+        _consecutive_errors), NOT silently swallowed - an earlier version of
+        this loop just did `except: pass`, which meant a persistently
+        failing poll (bad IP, network issue, unexpected response format, or
+        - as turned out to be the actual cause - missing auth) would look
+        identical in the UI to "connected but quiet", with zero way to tell
+        the difference. Now: the first failure and every 5th consecutive one
+        after that get logged as a visible warning line, and the error state
+        is exposed via get_state()/get_status() for the UI.
+
+        force_close=True: the ESP32's web server sends "Connection: close"
+        on every response (confirmed via browser DevTools inspection) - it
+        never keeps connections alive. aiohttp's default connector still
+        tries to pool/reuse connections assuming keep-alive is possible,
+        which can race against the server closing its end and produce
+        occasional single-request failures (seen in practice as a "fail
+        once, recover, fail once, recover" pattern - each failure isolated
+        and immediately self-correcting, never sustained). Telling the
+        connector not to bother pooling matches what the server already
+        tells us to expect and removes that race entirely.
+
+        Auth is sent as an explicit Authorization header via
+        aiohttp.encode_basic_auth() rather than the ClientSession(auth=...)
+        /aiohttp.BasicAuth shortcut - the latter is deprecated as of
+        aiohttp 3.14 and slated for removal in 4.0."""
+        auth_header = {"Authorization": aiohttp.encode_basic_auth("admin", self.wifi_console_password)}
+        connector = aiohttp.TCPConnector(force_close=True)
+        async with aiohttp.ClientSession(headers=auth_header, connector=connector) as session:
+            while self.wifi_console_enabled:
+                try:
+                    url = f"http://{self.wifi_console_ip}/cs?c2={self.wifi_console_last_id}"
+                    timeout = aiohttp.ClientTimeout(total=5)
+                    async with session.get(url, timeout=timeout) as resp:
+                        if resp.status != 200:
+                            raise RuntimeError(f"HTTP {resp.status} from {url}")
+                        text = await resp.text()
+                        nl = text.find('\n')
+                        if nl >= 0:
+                            new_id, new_content = text[:nl], text[nl + 1:]
+                        else:
+                            new_id, new_content = text, ''
+                        if new_id:
+                            self.wifi_console_last_id = new_id.strip()
+                        for line in new_content.split('\n'):
+                            line = line.strip()
+                            if line:
+                                self.wifi_console_lines_received += 1
+                                line_type = self._detect_type(line)
+                                self.log(f"[WiFi] {line}", line_type, source="wifi")
+
+                    # Success - clear any prior error state
+                    if self.wifi_console_error_logged:
+                        self.log(
+                            f"WiFi console polling recovered after "
+                            f"{self.wifi_console_consecutive_errors} failed attempt(s)",
+                            "success"
+                        )
+                    self.wifi_console_last_error = None
+                    self.wifi_console_consecutive_errors = 0
+                    self.wifi_console_error_logged = False
+
+                except Exception as e:
+                    self.wifi_console_consecutive_errors += 1
+                    self.wifi_console_last_error = str(e)
+                    # Only surface a warning once a failure streak actually
+                    # persists (3+ in a row), not on every isolated blip -
+                    # see the __init__ comment on wifi_console_error_logged
+                    # for why. Once surfaced, keep reminding every 5th
+                    # attempt for a genuinely sustained outage.
+                    if self.wifi_console_consecutive_errors == 3 or (
+                        self.wifi_console_consecutive_errors > 3
+                        and self.wifi_console_consecutive_errors % 5 == 0
+                    ):
+                        self.wifi_console_error_logged = True
+                        self.log(
+                            f"WiFi console poll failed ({self.wifi_console_consecutive_errors} "
+                            f"consecutive failure(s)): {e}",
+                            "error"
+                        )
+
+                # Match the ~2.3s interval the firmware's own web page uses,
+                # so we're not hammering the ESP32's web server needlessly.
+                await asyncio.sleep(2.3)
+
     async def get_state(self):
         """Full snapshot including the entire in-memory line history. Used
         exactly once per browser connection - right after its WebSocket opens
@@ -348,7 +782,14 @@ class TinyGSServer:
                 "totalBytes": self.total_bytes,
                 "uptime": (datetime.datetime.now() - self.start_time).total_seconds() if self.start_time else 0,
                 "ports": [p.device for p in serial.tools.list_ports.comports()],
-                "logDir": LOG_DIR
+                "logDir": LOG_DIR,
+                "wifiConsoleEnabled": self.wifi_console_enabled,
+                "wifiConsoleIp": self.wifi_console_ip,
+                "wifiConsoleLines": self.wifi_console_lines_received,
+                "wifiConsoleError": self.wifi_console_last_error,
+                "wifiConsoleErrorCount": self.wifi_console_consecutive_errors,
+                "gitVersion": GIT_VERSION,
+                "wifiConsoleHasSavedPassword": bool(self.wifi_console_password),
             }
 
     async def get_status(self):
@@ -364,7 +805,14 @@ class TinyGSServer:
                 "totalBytes": self.total_bytes,
                 "uptime": (datetime.datetime.now() - self.start_time).total_seconds() if self.start_time else 0,
                 "ports": [p.device for p in serial.tools.list_ports.comports()],
-                "logDir": LOG_DIR
+                "logDir": LOG_DIR,
+                "wifiConsoleEnabled": self.wifi_console_enabled,
+                "wifiConsoleIp": self.wifi_console_ip,
+                "wifiConsoleLines": self.wifi_console_lines_received,
+                "wifiConsoleError": self.wifi_console_last_error,
+                "wifiConsoleErrorCount": self.wifi_console_consecutive_errors,
+                "gitVersion": GIT_VERSION,
+                "wifiConsoleHasSavedPassword": bool(self.wifi_console_password),
             }
 
 
@@ -417,7 +865,8 @@ async def websocket_handler(request):
     current snapshot (see get_state()).
 
     Incoming client messages are JSON: {"action": "<name>", ...extra fields}.
-    Supported actions: connect, disconnect, clear, export, listPorts.
+    Supported actions: connect, disconnect, clear, export, listPorts,
+    startWifiConsole, stopWifiConsole.
 
     Outgoing message types the frontend listens for (see connectWS() in the
     HTML/JS below): state (full snapshot, sent once on open), status
@@ -473,6 +922,22 @@ async def websocket_handler(request):
                     ports = [p.device for p in serial.tools.list_ports.comports()]
                     await ws.send_json({"type": "ports", "data": ports})
 
+                elif action == "startWifiConsole":
+                    result = await server.start_wifi_console(data.get("ip"), data.get("password", ""))
+                    await ws.send_json({"type": "result", "data": result})
+                    status = await server.get_status()
+                    for c in server.clients:
+                        try: await c.send_json({"type": "status", "data": status})
+                        except: pass
+
+                elif action == "stopWifiConsole":
+                    result = await server.stop_wifi_console()
+                    await ws.send_json({"type": "result", "data": result})
+                    status = await server.get_status()
+                    for c in server.clients:
+                        try: await c.send_json({"type": "status", "data": status})
+                        except: pass
+
             except Exception as e:
                 await ws.send_json({"type": "error", "data": str(e)})
 
@@ -514,6 +979,16 @@ async def index_handler(request):
       display: flex;
       align-items: center;
       gap: 10px;
+    }
+    .version-tag {
+      font-size: 11px;
+      font-weight: 400;
+      font-family: "Ubuntu Mono", monospace;
+      color: #666680;
+      background: #1a1a28;
+      padding: 2px 8px;
+      border-radius: 4px;
+      cursor: help;
     }
     .status {
       display: flex;
@@ -711,6 +1186,23 @@ async def index_handler(request):
     .line.warn { color: #fbbf24; }
     .line.tx { color: #a78bfa; }
     .line.rx { color: #34d399; }
+    .trunc-badge {
+      display: inline-block;
+      margin-left: 8px;
+      padding: 0 6px;
+      border-radius: 4px;
+      background: rgba(251, 191, 36, 0.15);
+      color: #fbbf24;
+      font-size: 10px;
+      cursor: help;
+      user-select: none;
+      vertical-align: middle;
+    }
+    .line .wifi-tag {
+      color: #22d3ee;
+      font-weight: 600;
+      margin-right: 4px;
+    }
     .bottom-bar {
       display: flex;
       justify-content: space-between;
@@ -852,7 +1344,7 @@ async def index_handler(request):
 </head>
 <body>
   <div class="header">
-    <h2>🛰️ TinyGS Serial Dashboard</h2>
+    <h2>🛰️ TinyGS Serial Dashboard <span class="version-tag" title="Git commit of the currently running server code - use this to confirm an upgrade/restart actually picked up your latest changes">__GIT_VERSION__</span></h2>
     <div class="status">
       <div class="status-dot" id="statusDot"></div>
       <span id="statusText">Disconnected</span>
@@ -906,6 +1398,9 @@ async def index_handler(request):
     </button>
     <button onclick="openLogsModal()">
       <span>📂</span> Logs
+    </button>
+    <button id="btnWifiConsole" onclick="openWifiConsoleModal()">
+      <span>🌐</span> WiFi Console
     </button>
   </div>
 
@@ -964,6 +1459,48 @@ async def index_handler(request):
     </div>
   </div>
 
+  <div class="modal-overlay" id="wifiConsoleModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>🌐 WiFi Console</h3>
+        <button class="modal-close" onclick="closeWifiConsoleModal()">✕</button>
+      </div>
+      <div class="modal-body" style="padding: 16px;">
+        <p style="color:#a0a0b8; font-size:13px; line-height:1.5; margin-bottom:14px;">
+          Polls your ESP32's own local web dashboard (the same one you'd
+          visit in a browser at its IP address) for console text, over WiFi
+          instead of USB serial. This source reads the firmware's complete,
+          untruncated log buffer directly - hex dumps from here are never
+          cut short, unlike the USB serial connection. Lines from this
+          source appear in the terminal tagged <code>[WiFi]</code>.
+        </p>
+        <p style="color:#a0a0b8; font-size:12px; line-height:1.5; margin-bottom:14px;">
+          This endpoint requires your device's <strong>admin/AP password</strong>
+          (the same one you use to log into its web config panel) - the
+          firmware rejects unauthenticated requests, which is why this field
+          is required, not optional.
+        </p>
+        <p id="wifiConsoleSavedHint" style="display:none; color:#4ade80; font-size:12px; margin-bottom:10px;">
+          🔑 Using a previously saved IP/password - leave fields blank to
+          reuse them, or fill in new values to update.
+        </p>
+        <div id="wifiConsoleIdleForm">
+          <input id="wifiConsoleIpInput" placeholder="ESP32 IP address, e.g. 192.168.113.210" style="margin-bottom:10px;">
+          <input id="wifiConsolePasswordInput" type="password" placeholder="Admin/AP password" style="margin-bottom:10px;">
+          <button class="primary" onclick="startWifiConsole()">Start Polling</button>
+        </div>
+        <div id="wifiConsoleActiveInfo" style="display:none;">
+          <p id="wifiConsoleStatusLine" style="color:#4ade80; font-size:13px;">
+            🟢 Polling <span id="wifiConsoleActiveIp"></span> -
+            <span id="wifiConsoleLineCount">0</span> lines received
+          </p>
+          <p id="wifiConsoleErrorLine" style="display:none; color:#f87171; font-size:12px; margin-top:-8px;"></p>
+          <button class="danger" onclick="stopWifiConsole()">Stop Polling</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script>
     // Frontend overview: a single persistent WebSocket (see connectWS) drives
     // everything - there's no polling. `lines` is the client-side mirror of
@@ -972,6 +1509,15 @@ async def index_handler(request):
     // changes. See websocket_handler's docstring (server side) for the full
     // message protocol this listens for.
     let ws, currentFilter = 'all', lines = [], isConnected = false;
+    // Wall-clock anchor for the live uptime ticker (see the setInterval near
+    // the bottom of this script). Sever gives us `state.uptime` (seconds
+    // elapsed as of that message) only occasionally - on connect/disconnect
+    // and initial page load - not every second. Without ticking locally in
+    // between those messages, the uptime display would show a stale, frozen
+    // value the rest of the time. `uptimeAnchor` is the epoch-ms timestamp
+    // (client clock) corresponding to when the connection started, computed
+    // from the most recent state/status message; null while disconnected.
+    let uptimeAnchor = null;
     const terminal = document.getElementById('terminal');
     const btnConnect = document.getElementById('btnConnect');
     const btnClear = document.getElementById('btnClear');
@@ -1022,6 +1568,75 @@ async def index_handler(request):
       document.getElementById('logsModal').classList.remove('show');
     }
 
+    function openWifiConsoleModal() {
+      document.getElementById('wifiConsoleModal').classList.add('show');
+    }
+
+    function closeWifiConsoleModal() {
+      document.getElementById('wifiConsoleModal').classList.remove('show');
+    }
+
+    let wifiConsoleHasSavedPassword = false;
+
+    function startWifiConsole() {
+      const ip = document.getElementById('wifiConsoleIpInput').value.trim();
+      const password = document.getElementById('wifiConsolePasswordInput').value;
+      if (!ip) { showToast('Enter an IP address first'); return; }
+      if (!password && !wifiConsoleHasSavedPassword) {
+        showToast('Enter the admin/AP password - the firmware requires it');
+        return;
+      }
+      sendAction('startWifiConsole', {ip, password});
+    }
+
+    function stopWifiConsole() {
+      sendAction('stopWifiConsole');
+    }
+
+    function updateWifiConsoleUI(state) {
+      const idleForm = document.getElementById('wifiConsoleIdleForm');
+      const activeInfo = document.getElementById('wifiConsoleActiveInfo');
+      const btn = document.getElementById('btnWifiConsole');
+      const statusLine = document.getElementById('wifiConsoleStatusLine');
+      const errorLine = document.getElementById('wifiConsoleErrorLine');
+      const savedHint = document.getElementById('wifiConsoleSavedHint');
+      const ipInput = document.getElementById('wifiConsoleIpInput');
+
+      wifiConsoleHasSavedPassword = !!state.wifiConsoleHasSavedPassword;
+
+      // Pre-fill the IP field from a previous session (server-persisted -
+      // see CONFIG_FILE), but only if the user hasn't already typed
+      // something themselves, so we don't clobber active typing on every
+      // state update.
+      if (state.wifiConsoleIp && !ipInput.value && document.activeElement !== ipInput) {
+        ipInput.value = state.wifiConsoleIp;
+      }
+      savedHint.style.display = (wifiConsoleHasSavedPassword && !state.wifiConsoleEnabled) ? 'block' : 'none';
+
+      if (state.wifiConsoleEnabled) {
+        idleForm.style.display = 'none';
+        activeInfo.style.display = 'block';
+        const ip = state.wifiConsoleIp || '';
+        const lineCount = (state.wifiConsoleLines || 0).toLocaleString();
+        // Rebuild fully each time (not a partial mutation) so the status
+        // line can't get stuck showing a stale "(currently failing)" state
+        // after polling actually recovers.
+        if (state.wifiConsoleErrorCount > 0) {
+          statusLine.innerHTML = `🟡 Polling <span id="wifiConsoleActiveIp">${ip}</span> - <span id="wifiConsoleLineCount">${lineCount}</span> lines received (currently failing)`;
+          errorLine.style.display = 'block';
+          errorLine.textContent = `⚠ ${state.wifiConsoleErrorCount} consecutive failure(s): ${state.wifiConsoleError || 'unknown error'}`;
+        } else {
+          statusLine.innerHTML = `🟢 Polling <span id="wifiConsoleActiveIp">${ip}</span> - <span id="wifiConsoleLineCount">${lineCount}</span> lines received`;
+          errorLine.style.display = 'none';
+        }
+        btn.classList.add('danger');
+      } else {
+        idleForm.style.display = 'block';
+        activeInfo.style.display = 'none';
+        btn.classList.remove('danger');
+      }
+    }
+
     async function openLogViewer(encodedName) {
       const name = decodeURIComponent(encodedName);
       const viewer = document.getElementById('logViewer');
@@ -1054,6 +1669,9 @@ async def index_handler(request):
     });
     document.getElementById('logViewer').addEventListener('click', (e) => {
       if (e.target.id === 'logViewer') closeLogViewer();
+    });
+    document.getElementById('wifiConsoleModal').addEventListener('click', (e) => {
+      if (e.target.id === 'wifiConsoleModal') closeWifiConsoleModal();
     });
 
     function connectWS() {
@@ -1095,10 +1713,16 @@ async def index_handler(request):
       document.getElementById('mBytes').textContent = formatBytes(state.totalBytes);
       document.getElementById('mJson').textContent = (state.jsonFramesCount ?? (state.jsonFrames ? state.jsonFrames.length : 0)).toLocaleString();
       document.getElementById('mUptime').textContent = formatUptime(state.uptime);
+
+      // Re-derive the anchor every time we get a fresh reading from the
+      // server, so the local ticker (below) stays in sync and self-corrects
+      // for any client/server clock drift rather than accumulating error.
+      uptimeAnchor = state.connected ? (Date.now() - state.uptime * 1000) : null;
       document.getElementById('portInfo').textContent = state.connected ? 'Streaming...' : 'No port selected';
       document.getElementById('termTitle').textContent = state.connected ? 'serial://active @ 115200' : 'serial://waiting';
 
       updatePortList(state.ports);
+      updateWifiConsoleUI(state);
 
       btnConnect.innerHTML = state.connected ? '<span>⏹</span> Disconnect' : '<span>▶</span> Connect';
       btnConnect.classList.toggle('danger', state.connected);
@@ -1148,7 +1772,28 @@ async def index_handler(request):
       const toShow = filtered.slice(-400);
       terminal.innerHTML = toShow.map(l => {
         const cls = l.type || 'normal';
-        return `<div class="line ${cls}"><span class="ts">${l.time}</span>${escapeHtml(l.text)}</div>`;
+        // Firmware-side truncation badge: see TRUNCATION_MARKER_RE (backend)
+        // and the module docstring's "RESOLVED (diagnostically)" section.
+        // This is purely informational - the underlying satellite data was
+        // still captured in full and sent to the TinyGS MQTT network; only
+        // this local console preview got cut short by the ESP32's own
+        // fixed-size Serial buffer during a high-volume burst.
+        const truncBadge = l.truncated
+          ? `<span class="trunc-badge" title="Console preview cut short by the ESP32's own serial buffer during a high-volume burst - the full packet data was still captured and sent to the TinyGS network via MQTT. Nothing was actually lost.">⚠ preview truncated</span>`
+          : '';
+        // Lines from the WiFi console poller (see startWifiConsole) carry
+        // source: 'wifi' (set server-side in log(), not inferred here) and
+        // are also prefixed "[WiFi] " in their raw text - the prefix is
+        // useful when reading the raw log file directly, but for display we
+        // strip it and show a proper tag instead, driven by the authoritative
+        // `source` field rather than guessing from the text itself.
+        let bodyText = escapeHtml(l.text);
+        let wifiTag = '';
+        if (l.source === 'wifi') {
+          wifiTag = '<span class="wifi-tag" title="From the WiFi console poller - reads the complete internal log buffer maintained by the firmware, never truncated">🌐 WiFi</span>';
+          if (bodyText.startsWith('[WiFi] ')) bodyText = bodyText.slice('[WiFi] '.length);
+        }
+        return `<div class="line ${cls}"><span class="ts">${l.time}</span>${wifiTag}${bodyText}${truncBadge}</div>`;
       }).join('');
       document.getElementById('lineCount').textContent = filtered.length.toLocaleString() + ' lines';
     }
@@ -1209,10 +1854,20 @@ async def index_handler(request):
       return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
 
+    // Ticks the UPTIME display once a second using uptimeAnchor (set in
+    // updateStatusUI), so it behaves like an actual live timer instead of
+    // only updating whenever a status/state message happens to arrive.
+    setInterval(() => {
+      if (uptimeAnchor !== null) {
+        document.getElementById('mUptime').textContent = formatUptime((Date.now() - uptimeAnchor) / 1000);
+      }
+    }, 1000);
+
     connectWS();
   </script>
 </body>
 </html>'''
+    html = html.replace('__GIT_VERSION__', GIT_VERSION)
     return web.Response(text=html, content_type='text/html')
 
 
@@ -1222,6 +1877,15 @@ async def on_startup(app):
     server.loop = asyncio.get_event_loop()
     t = threading.Thread(target=server.serial_reader, daemon=True)
     t.start()
+
+    # Auto-resume WiFi Console polling if it was active when the server last
+    # stopped (restart/upgrade) - see the credential-persistence comment in
+    # TinyGSServer.__init__. Entirely automatic; no browser interaction
+    # needed. Only attempted if we actually have both an IP and password
+    # saved (a corrupt/partial config file just means this silently doesn't
+    # auto-resume, same as never having enabled it).
+    if server._wifi_console_should_resume and server.wifi_console_ip and server.wifi_console_password:
+        await server.start_wifi_console(server.wifi_console_ip, server.wifi_console_password)
 
 
 app = web.Application()
@@ -1235,6 +1899,7 @@ app.on_startup.append(on_startup)
 if __name__ == '__main__':
     print("=" * 55)
     print("🛰️  TinyGS Dashboard Server")
+    print(f"Version: {GIT_VERSION}")
     print("=" * 55)
     print("Open http://localhost:5000 in your browser")
     print("Logs saved to: " + LOG_DIR)

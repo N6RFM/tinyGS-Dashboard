@@ -213,6 +213,17 @@ class TinyGSServer:
         self.wifi_console_lines_received = 0
         self.wifi_console_last_error = None
         self.wifi_console_consecutive_errors = 0
+        # Tracks whether a "poll failed" warning was actually logged for the
+        # CURRENT failure streak - isolated single-attempt blips (WiFi jitter,
+        # the embedded server being briefly busy) are extremely common over
+        # many hours of continuous polling and self-heal within one retry;
+        # logging every one of them just adds noise for something that costs
+        # no data (the position tracker only advances on success, so a
+        # failed poll never skips content). Only sustained failure streaks
+        # get logged - see the threshold in _wifi_console_poll_loop(). This
+        # flag makes sure a "recovered" message never appears without a
+        # matching "failed" message having been shown first.
+        self.wifi_console_error_logged = False
         self._wifi_console_task = None
 
     def log(self, text, line_type="normal", source="serial"):
@@ -621,7 +632,7 @@ class TinyGSServer:
                                 self.log(f"[WiFi] {line}", line_type, source="wifi")
 
                     # Success - clear any prior error state
-                    if self.wifi_console_consecutive_errors > 0:
+                    if self.wifi_console_error_logged:
                         self.log(
                             f"WiFi console polling recovered after "
                             f"{self.wifi_console_consecutive_errors} failed attempt(s)",
@@ -629,14 +640,21 @@ class TinyGSServer:
                         )
                     self.wifi_console_last_error = None
                     self.wifi_console_consecutive_errors = 0
+                    self.wifi_console_error_logged = False
 
                 except Exception as e:
                     self.wifi_console_consecutive_errors += 1
                     self.wifi_console_last_error = str(e)
-                    # Log a visible warning on the first failure, then every
-                    # 5th after that - visible without spamming the terminal
-                    # on every single 2.3s tick if the IP is just wrong.
-                    if self.wifi_console_consecutive_errors == 1 or self.wifi_console_consecutive_errors % 5 == 0:
+                    # Only surface a warning once a failure streak actually
+                    # persists (3+ in a row), not on every isolated blip -
+                    # see the __init__ comment on wifi_console_error_logged
+                    # for why. Once surfaced, keep reminding every 5th
+                    # attempt for a genuinely sustained outage.
+                    if self.wifi_console_consecutive_errors == 3 or (
+                        self.wifi_console_consecutive_errors > 3
+                        and self.wifi_console_consecutive_errors % 5 == 0
+                    ):
+                        self.wifi_console_error_logged = True
                         self.log(
                             f"WiFi console poll failed ({self.wifi_console_consecutive_errors} "
                             f"consecutive failure(s)): {e}",

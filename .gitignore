@@ -1,6 +1,10 @@
 # Python virtual environment - recreated by install.sh, never committed
 venv/
 
+# WiFi Console credentials (can contain a plaintext admin/AP password -
+# see the "Security note" in README.md) - never commit this
+config.json
+
 # Session output - logs, raw captures, and exported JSON frames are all
 # machine/session-specific and can get large; keep the folder itself
 # tracked (see logs/.gitkeep) but not its contents

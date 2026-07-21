@@ -85,6 +85,7 @@ import json
 import datetime
 import os
 import re
+import subprocess
 import threading
 import time
 from collections import deque
@@ -99,11 +100,23 @@ import aiohttp
 TRUNCATION_MARKER_RE = re.compile(r'\.\.\.$')
 
 # Known firmware strings that legitimately end in "..." as decoration, NOT
-# as a truncation marker - confirmed directly from the firmware source
-# (Radio.cpp: Log::console(PSTR("[SX12xx] Initializing ... "))). Excluded
-# from the truncation badge so this specific normal boot message doesn't
-# get flagged as data loss.
-_KNOWN_NON_TRUNCATION_SUFFIXES = ("Initializing ...",)
+# as a truncation marker. Found by grepping the ENTIRE firmware source tree
+# for every literal "..." in a Log::console/error/info/debug/*Async() call
+# (see tinyGS/src/Radio/Radio.cpp, Mqtt/MQTT_Client.cpp,
+# ConfigManager/ConfigManager.cpp, OTA/OTA.cpp, Improv/tinygs_improv.cpp) -
+# not just excluding phrases one at a time as they're encountered, which
+# missed several of these the first time around.
+_KNOWN_NON_TRUNCATION_SUFFIXES = (
+    "Initializing ...",                        # Radio.cpp - SX12xx radio init
+    "Enable TCXO 33...",                       # Radio.cpp - SX1276 TCXO enable
+    "Processing AX.25 frame...",                # Radio.cpp - AX.25 frame processing
+    "Attempting MQTT connection...",            # MQTT_Client.cpp
+    "Restarting...",                            # MQTT_Client.cpp - after repeated MQTT failures
+    "retrying...",                              # MQTT_Client.cpp - MQTT timeout retry
+    "Automatic board detection running...",     # ConfigManager.cpp
+    "Checking for firmware Updates...",         # OTA.cpp
+    "Failed to connect to wifi...",             # Improv/tinygs_improv.cpp
+)
 
 
 def _is_truncated(text):
@@ -147,7 +160,74 @@ SERIAL_PORT = None      # Auto-detect if None
 BAUD_RATE = 115200
 MAX_LINES = 2000        # in-memory + browser-side line history cap (see deque below)
 LOG_DIR = os.path.expanduser("~/tinygs-dashboard/logs")
+CONFIG_FILE = os.path.expanduser("~/tinygs-dashboard/config.json")
 # ================================
+
+
+def _get_git_version():
+    """Best-effort short git commit hash of the running server code, shown
+    in the UI and startup banner so it's always possible to tell exactly
+    which build is actually live - useful after a `git pull` + restart, or
+    when troubleshooting "is my fix actually deployed?" (a real recurring
+    point of confusion during development). Appends "-dirty" if there are
+    uncommitted local changes. Falls back to "unknown" if this isn't running
+    from a git checkout, or git isn't installed - never fatal."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=script_dir, stderr=subprocess.DEVNULL, timeout=2
+        ).decode().strip()
+        is_dirty = subprocess.call(
+            ["git", "diff", "--quiet"],
+            cwd=script_dir, stderr=subprocess.DEVNULL
+        ) != 0
+        return commit + ("-dirty" if is_dirty else "")
+    except Exception:
+        return "unknown"
+
+
+GIT_VERSION = _get_git_version()
+
+
+def _load_config():
+    """Best-effort load of the persisted config file (currently just WiFi
+    Console settings). Returns {} on any error (missing file, corrupt JSON,
+    permissions issue) - this is a convenience feature, never something that
+    should prevent the server from starting."""
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_config(config):
+    """Best-effort save of the config file, with restrictive permissions
+    (owner read/write only) since it can contain a plaintext password.
+
+    SECURITY NOTE: this password is stored in plaintext on disk, protected
+    only by OS file permissions (chmod 600) - not encrypted. That's an
+    explicit, documented tradeoff for convenience (avoiding re-entering it
+    after every restart/upgrade) on what's assumed to be a personal,
+    single-user machine. If that assumption doesn't hold for your setup,
+    don't rely on this - the file lives at CONFIG_FILE (~/tinygs-dashboard/
+    config.json) and can be deleted/edited manually, or this feature simply
+    not used (re-enter the password each session instead).
+
+    Merges `config` into whatever's already on disk rather than replacing
+    the file wholesale - callers only pass the keys they're updating (e.g.
+    just the WiFi Console fields, or just the watchdog fields), and a
+    naive overwrite would silently wipe out whichever group wasn't
+    included in that particular call."""
+    try:
+        merged = {**_load_config(), **config}
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(merged, f)
+        os.chmod(CONFIG_FILE, 0o600)
+    except Exception:
+        pass  # convenience feature only - never fatal if this fails
+
 
 
 class TinyGSServer:
@@ -163,7 +243,16 @@ class TinyGSServer:
         self.connected = False
         self.ser = None
         self.clients = set()
-        self.start_time = None
+        self.start_time = None  # serial-specific connect time, kept for compatibility
+        # UPTIME/session-time display needs a start time that's active
+        # whenever EITHER connection type is running, not just serial - the
+        # original design only ever set self.start_time from
+        # connect_serial()/disconnect_serial(), so UPTIME stayed frozen at
+        # 00:00:00 for anyone using WiFi Console without a serial
+        # connection, despite a real session genuinely being active. See
+        # _refresh_session_start_time(), called from all four
+        # connect/disconnect/start/stop methods.
+        self.session_start_time = None
         self._lock = threading.Lock()
         self.loop = None  # set once the asyncio event loop is running (see on_startup)
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -206,9 +295,18 @@ class TinyGSServer:
         # (works purely over WiFi) and is off by default - enabled via the
         # "🌐 WiFi Console" control in the UI once you know your board's
         # local IP (shown on its own web dashboard page).
+        #
+        # Credentials persist across restarts via CONFIG_FILE (see
+        # _load_config/_save_config above) - loaded here as defaults so a
+        # server restart/upgrade doesn't require re-entering the IP/password
+        # in the browser every time. If polling was active when the server
+        # last stopped (was_enabled), on_startup() below resumes it
+        # automatically with no browser interaction needed at all.
+        _saved = _load_config()
         self.wifi_console_enabled = False
-        self.wifi_console_ip = None
-        self.wifi_console_password = ""
+        self.wifi_console_ip = _saved.get("wifi_console_ip")
+        self.wifi_console_password = _saved.get("wifi_console_password", "")
+        self._wifi_console_should_resume = bool(_saved.get("wifi_console_was_enabled"))
         self.wifi_console_last_id = "0"
         self.wifi_console_lines_received = 0
         self.wifi_console_last_error = None
@@ -225,6 +323,51 @@ class TinyGSServer:
         # matching "failed" message having been shown first.
         self.wifi_console_error_logged = False
         self._wifi_console_task = None
+
+        # Packet-silence / liveness watchdog: detects a stalled receiver
+        # (radio silently stopped decoding, or the whole board hung) and can
+        # hard-reset the ESP32 over the already-open serial connection - a
+        # brief RTS pulse with DTR held low, the same technique esptool uses
+        # for a "hard reset" rather than a bootloader/download entry (see
+        # hard_reset_board() below). Two independent triggers, either fires:
+        #   1. No JSON telemetry frame has been parsed for
+        #      watchdog_silence_hours. What counts as "too long" depends
+        #      entirely on your own pass cadence, so there's no safe
+        #      built-in default here beyond a conservative 18h - tune it
+        #      from the Watchdog panel once you know your normal gap
+        #      between passes.
+        #   2. The WiFi Console endpoint (if you've configured one - see
+        #      wifi_console_ip above) stops responding for
+        #      WATCHDOG_HTTP_FAILS_BEFORE_RESET consecutive polls. This is
+        #      a stronger, faster signal that the board itself has hung
+        #      (network/task stack dead), independent of whether a
+        #      satellite happens to be overhead - so it's checked even if
+        #      packet-silence hasn't hit its threshold yet.
+        # Off by default: turning this on unattended with an untuned
+        # timeout risks resetting a perfectly healthy, just-quiet receiver.
+        self.watchdog_enabled = _saved.get("watchdog_enabled", False)
+        self.watchdog_silence_hours = _saved.get("watchdog_silence_hours", 18)
+        self.last_frame_seen = datetime.datetime.now(datetime.timezone.utc)
+        self.last_reset = None
+        self.reset_history = deque(maxlen=25)
+        self._watchdog_task = None
+
+    def _refresh_session_start_time(self):
+        """Keeps self.session_start_time in sync with whether EITHER
+        connection type (serial or WiFi Console) is currently active. Call
+        this after any change to self.connected or self.wifi_console_enabled.
+        Sets it on the transition from "nothing active" to "something
+        active" (first connection of a session), and clears it once BOTH
+        are inactive (session fully ended) - so reconnecting later starts a
+        fresh UPTIME count rather than continuing a stale one. If one
+        connection type is already active when the other one starts, the
+        original start time is preserved (the session started when the
+        FIRST connection came up, not when a second one joined)."""
+        any_active = self.connected or self.wifi_console_enabled
+        if any_active and self.session_start_time is None:
+            self.session_start_time = datetime.datetime.now()
+        elif not any_active:
+            self.session_start_time = None
 
     def log(self, text, line_type="normal", source="serial"):
         """Record one logical line of output (or an internal event like
@@ -283,6 +426,11 @@ class TinyGSServer:
                         obj["_raw"] = text
                         obj["_source"] = source
                         self.json_frames.append(obj)
+                        # Watchdog's packet-silence timer resets on any
+                        # successfully decoded telemetry frame, regardless
+                        # of source (serial or WiFi) - see the watchdog
+                        # fields/methods for why this exists.
+                        self.last_frame_seen = now_utc
                 except:
                     pass
 
@@ -387,9 +535,22 @@ class TinyGSServer:
                         line_type = self._detect_type(line)
                         self.log(line, line_type)
 
-            except serial.SerialException as e:
+            except (serial.SerialException, OSError) as e:
+                # OSError alongside SerialException: when the underlying
+                # USB device vanishes out from under an open file
+                # descriptor (unplugged, or re-enumerated during a
+                # reset - see reset_board()/_reconnect_after_reset()),
+                # pyserial doesn't always wrap that in SerialException:
+                # depending on the platform/backend it can surface as a
+                # bare OSError instead. That used to fall through to the
+                # generic `except Exception` below, which just slept and
+                # looped again - silently spinning on a dead descriptor
+                # instead of ever recognizing the disconnect, so nothing
+                # downstream (including the watchdog's reconnect logic)
+                # would ever notice the port was actually gone.
                 self.log(f"Serial error: {e}", "error")
                 self.connected = False
+                self._refresh_session_start_time()
                 if self.ser:
                     try: self.ser.close()
                     except: pass
@@ -477,6 +638,7 @@ class TinyGSServer:
 
             self.connected = True
             self.start_time = datetime.datetime.now()
+            self._refresh_session_start_time()
             self.log(f"Connected to {port} @ {BAUD_RATE} baud", "success")
 
             # Diagnostic: log the actual read-back modem control line state.
@@ -516,6 +678,7 @@ class TinyGSServer:
         useful to do about them). serial_reader() notices self.connected is
         False on its next loop iteration and idles until reconnected."""
         self.connected = False
+        self._refresh_session_start_time()
         if self.ser:
             try: self.ser.close()
             except: pass
@@ -537,19 +700,34 @@ class TinyGSServer:
         same password, whenever the device is in its normal online state.
         Without it, every poll request gets rejected and nothing ever comes
         through - this was the actual cause of "0 lines received" with no
-        visible error before this was added."""
+        visible error before this was added.
+
+        If `ip`/`password` are omitted (empty), falls back to whatever was
+        previously saved to CONFIG_FILE (or used earlier this session) -
+        lets the browser resubmit with just an empty password field after a
+        restart, rather than forcing full re-entry every time. On success,
+        the working credentials are persisted to disk (see _save_config)."""
         if self.wifi_console_enabled:
             return {"ok": False, "error": "WiFi console is already running"}
-        ip = (ip or "").strip()
+        ip = (ip or "").strip() or (self.wifi_console_ip or "")
+        password = password or self.wifi_console_password or ""
         if not ip:
             return {"ok": False, "error": "ESP32 IP address is required"}
+        if not password:
+            return {"ok": False, "error": "Admin/AP password is required"}
 
         self.wifi_console_ip = ip
-        self.wifi_console_password = password or ""
+        self.wifi_console_password = password
         self.wifi_console_last_id = "0"
         self.wifi_console_lines_received = 0
         self.wifi_console_enabled = True
+        self._refresh_session_start_time()
         self._wifi_console_task = asyncio.create_task(self._wifi_console_poll_loop())
+        _save_config({
+            "wifi_console_ip": ip,
+            "wifi_console_password": password,
+            "wifi_console_was_enabled": True,
+        })
         self.log(
             f"WiFi console polling started ({ip}) - lines from this source "
             f"are tagged [WiFi] and are NOT subject to the USB serial "
@@ -559,13 +737,260 @@ class TinyGSServer:
         return {"ok": True, "ip": ip}
 
     async def stop_wifi_console(self):
-        """Stop WiFi console polling. Always succeeds."""
+        """Stop WiFi console polling. Always succeeds. Credentials stay
+        saved to disk (so they're still pre-filled/reusable next time) -
+        only the "was running" flag is cleared, so a restart won't
+        auto-resume a session you deliberately stopped."""
         self.wifi_console_enabled = False
+        self._refresh_session_start_time()
         if self._wifi_console_task:
             self._wifi_console_task.cancel()
             self._wifi_console_task = None
+        _save_config({
+            "wifi_console_ip": self.wifi_console_ip,
+            "wifi_console_password": self.wifi_console_password,
+            "wifi_console_was_enabled": False,
+        })
         self.log("WiFi console polling stopped", "normal")
         return {"ok": True}
+
+    def hard_reset_board(self):
+        """Pulse RTS low->high on the already-open serial connection to
+        hard-reset the ESP32 - the same DTR/RTS technique esptool's own
+        "hard reset" uses. DTR is explicitly held low (not toggled) so the
+        board boots normally rather than dropping into the bootloader/
+        download mode, which is what happens if GPIO0 (wired to DTR on the
+        standard ESP32 dev-board auto-reset circuit) is pulled low at the
+        same moment EN (wired to RTS) is.
+
+        Deliberately reuses self.ser rather than opening a second
+        serial.Serial() on the same device path - the reader thread already
+        owns the one open port, and a second open would just fail."""
+        if not self.ser or not self.connected:
+            raise RuntimeError("Not connected - open the serial connection first")
+        self.ser.dtr = False   # keep GPIO0 high -> normal boot, not bootloader
+        self.ser.rts = True    # pull EN low -> chip held in reset
+        time.sleep(0.1)
+        self.ser.rts = False   # release EN -> chip boots normally
+
+    async def reset_board(self, reason, manual=False):
+        """Perform a watchdog (or manual) reset and record it. Always logs
+        the outcome to the normal console/stream log too, so a reset shows
+        up in context with everything else that was happening at the time -
+        not just in the separate reset_history list."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            self.hard_reset_board()
+        except Exception as e:
+            self.log(f"Watchdog reset FAILED ({reason}): {e}", "error")
+            return {"ok": False, "error": str(e)}
+
+        self.last_reset = now
+        self.last_frame_seen = now  # don't immediately re-trigger on next check
+        self.reset_history.appendleft({
+            "time": now.isoformat(),
+            "reason": reason,
+            "manual": manual,
+        })
+        self.log(
+            f"Board hard-reset via RTS pulse ({reason})"
+            + (" - manual" if manual else " - automatic watchdog"),
+            "success" if manual else "warn",
+        )
+
+        # The board is now physically rebooting, so the existing serial
+        # connection is moot regardless of whether the OS notices right
+        # away - close it ourselves now rather than waiting for the reader
+        # thread to eventually hit a read error (which, on some
+        # USB-serial drivers, can take a while, or in rarer cases never
+        # cleanly surface as serial.SerialException at all - see the
+        # broadened except clause in serial_reader()). Then hand off to
+        # _reconnect_after_reset() to watch for the board reappearing,
+        # possibly under a different /dev/ttyUSB*//dev/ttyACM* path if the
+        # reboot caused USB re-enumeration.
+        previous_port = self.ser.port if self.ser else None
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+        self.ser = None
+        self.connected = False
+        self._refresh_session_start_time()
+        asyncio.create_task(self._reconnect_after_reset(previous_port))
+
+        # Push a status update to every open browser tab immediately - not
+        # just for the manual (button-triggered) path, which already gets
+        # one from the websocket handler, but also for automatic resets
+        # fired from _watchdog_loop, which has no handler wrapping it.
+        # Without this, the Watchdog panel's "Last reset" / history would
+        # only refresh whenever some *other* action happened to broadcast
+        # status next (or on a page reload) - the reset itself still shows
+        # up live in the terminal (via log()'s own broadcast above), but
+        # the panel could sit stale in the meantime.
+        status = await self.get_status()
+        for c in self.clients:
+            try:
+                await c.send_json({"type": "status", "data": status})
+            except Exception:
+                pass
+
+        return {"ok": True}
+
+    async def _reconnect_after_reset(self, previous_port, timeout_s=30):
+        """After a hard reset, the board's USB-serial connection
+        necessarily drops (the ESP32 reboots) and may re-enumerate under
+        a different /dev/ttyUSB*//dev/ttyACM* path entirely - especially
+        likely on a host with other USB-serial devices attached, where
+        Linux's device-node numbering isn't guaranteed stable across a
+        disconnect/reconnect cycle. Left alone, the dashboard would just
+        sit disconnected until a human happens to notice and click
+        Connect again - defeating the point of an *automatic* watchdog.
+
+        Polls for a plausible port to reappear and, once one does, calls
+        connect_serial(None) - the exact same Auto-detect codepath a
+        manual "Auto-detect" connect uses, including its preferred-chip
+        (CP2102/CH340/FT232/etc) matching - so this doesn't need to
+        duplicate or hardcode any device-matching logic of its own.
+
+        Deliberately a fixed timeout (default 30s) rather than polling
+        forever: if the board hasn't come back by then, something beyond
+        "USB is still enumerating" is likely wrong (bad cable, powered-off
+        hub port, or the reset didn't actually take), and repeatedly
+        attempting connect_serial() indefinitely in the background could
+        mask that from whoever's watching the dashboard."""
+        self.log(
+            f"Watching for {previous_port or 'the board'} (or a "
+            f"re-enumerated replacement) to reappear on USB...",
+            "normal",
+        )
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            await asyncio.sleep(1)
+            if self.connected:
+                return  # something else (e.g. a manual click) beat us to it
+
+            if not serial.tools.list_ports.comports():
+                continue  # nothing plugged in matching anything yet
+
+            result = await self.connect_serial(None)
+            if result.get("ok"):
+                new_port = result.get("port")
+                note = "" if new_port == previous_port else (
+                    f" (was {previous_port}, now {new_port} - USB "
+                    f"re-enumerated under a new device name)"
+                )
+                self.log(f"Auto-reconnected after reset: {new_port}{note}", "success")
+                status = await self.get_status()
+                for c in self.clients:
+                    try:
+                        await c.send_json({"type": "status", "data": status})
+                    except Exception:
+                        pass
+                return
+
+        self.log(
+            f"Board did not reappear on USB within {timeout_s}s of reset - "
+            f"may need a manual reconnect, or check the cable/hub/power.",
+            "error",
+        )
+
+    async def set_watchdog_config(self, enabled, silence_hours):
+        """Update and persist the watchdog's on/off state and silence
+        timeout. Takes effect on the very next _watchdog_loop tick - that
+        loop is always running (started once in on_startup) and just
+        no-ops on every check while disabled, so toggling this from the UI
+        never requires a server restart."""
+        try:
+            silence_hours = float(silence_hours)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Silence timeout must be a number"}
+        if silence_hours <= 0:
+            return {"ok": False, "error": "Silence timeout must be positive"}
+
+        self.watchdog_enabled = bool(enabled)
+        self.watchdog_silence_hours = silence_hours
+        _save_config({
+            "watchdog_enabled": self.watchdog_enabled,
+            "watchdog_silence_hours": self.watchdog_silence_hours,
+        })
+        self.log(
+            f"Watchdog {'enabled' if self.watchdog_enabled else 'disabled'}"
+            + (f", silence timeout {silence_hours}h" if self.watchdog_enabled else ""),
+            "normal",
+        )
+        return {"ok": True}
+
+    async def _check_wifi_panel_alive(self):
+        """One-shot liveness check against the WiFi Console IP's web
+        server (the same board, same endpoint a browser would hit at its
+        IP). Independent of whether WiFi Console polling is actually
+        turned on - only the IP needs to be known/saved. Uses its own
+        short-lived session (not the WiFi Console poller's persistent one)
+        since this runs on a much slower cadence and shouldn't be tangled
+        up with that loop's error-streak bookkeeping."""
+        if not self.wifi_console_ip:
+            return None  # no IP known - this trigger just can't be evaluated
+        try:
+            connector = aiohttp.TCPConnector(force_close=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                timeout = aiohttp.ClientTimeout(total=5)
+                async with session.get(f"http://{self.wifi_console_ip}/", timeout=timeout) as resp:
+                    return resp.status < 500
+        except Exception:
+            return False
+
+    async def _watchdog_loop(self):
+        """Background task, started once in on_startup and running for the
+        process lifetime (mirrors _wifi_console_poll_loop's pattern, but as
+        an always-on task rather than one that's started/stopped by hand -
+        there's no reason to tear this down, since it's a no-op whenever
+        watchdog_enabled is False).
+
+        Two independent triggers, either fires a reset:
+          1. HTTP liveness check against the WiFi Console IP (if known)
+             failing WATCHDOG_HTTP_FAILS_BEFORE_RESET times in a row - a
+             fast, strong signal the board has actually hung.
+          2. No telemetry frame parsed for watchdog_silence_hours - a
+             slower fallback that catches a radio-only stall even if the
+             web server is still answering fine.
+
+        A grace period after any reset (WATCHDOG_POST_RESET_GRACE_MINUTES)
+        skips checks entirely, giving the board time to reboot and
+        reconnect to WiFi before being judged again - without it, a slow
+        boot could look identical to "still hung" and trigger an
+        immediate second reset."""
+        WATCHDOG_CHECK_INTERVAL_S = 60
+        WATCHDOG_HTTP_FAILS_BEFORE_RESET = 5
+        WATCHDOG_POST_RESET_GRACE_MINUTES = 5
+
+        http_fail_count = 0
+        while True:
+            await asyncio.sleep(WATCHDOG_CHECK_INTERVAL_S)
+            if not self.watchdog_enabled:
+                http_fail_count = 0
+                continue
+
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if self.last_reset and (now - self.last_reset) < datetime.timedelta(
+                minutes=WATCHDOG_POST_RESET_GRACE_MINUTES
+            ):
+                http_fail_count = 0
+                continue
+
+            alive = await self._check_wifi_panel_alive()
+            if alive is False:
+                http_fail_count += 1
+                if http_fail_count >= WATCHDOG_HTTP_FAILS_BEFORE_RESET:
+                    await self.reset_board("web panel unresponsive")
+                    http_fail_count = 0
+                    continue
+            else:
+                http_fail_count = 0
+
+            silent_for = now - self.last_frame_seen
+            if silent_for > datetime.timedelta(hours=self.watchdog_silence_hours):
+                await self.reset_board(f"no telemetry frame for {silent_for}")
 
     async def _wifi_console_poll_loop(self):
         """Repeatedly GET /cs?c2=<id> from the ESP32's local web dashboard,
@@ -676,7 +1101,7 @@ class TinyGSServer:
                 "lines": list(self.lines),
                 "jsonFrames": self.json_frames,
                 "totalBytes": self.total_bytes,
-                "uptime": (datetime.datetime.now() - self.start_time).total_seconds() if self.start_time else 0,
+                "uptime": (datetime.datetime.now() - self.session_start_time).total_seconds() if self.session_start_time else 0,
                 "ports": [p.device for p in serial.tools.list_ports.comports()],
                 "logDir": LOG_DIR,
                 "wifiConsoleEnabled": self.wifi_console_enabled,
@@ -684,6 +1109,13 @@ class TinyGSServer:
                 "wifiConsoleLines": self.wifi_console_lines_received,
                 "wifiConsoleError": self.wifi_console_last_error,
                 "wifiConsoleErrorCount": self.wifi_console_consecutive_errors,
+                "gitVersion": GIT_VERSION,
+                "wifiConsoleHasSavedPassword": bool(self.wifi_console_password),
+                "watchdogEnabled": self.watchdog_enabled,
+                "watchdogSilenceHours": self.watchdog_silence_hours,
+                "lastFrameSeen": self.last_frame_seen.isoformat(),
+                "lastReset": self.last_reset.isoformat() if self.last_reset else None,
+                "resetHistory": list(self.reset_history),
             }
 
     async def get_status(self):
@@ -697,7 +1129,7 @@ class TinyGSServer:
                 "connected": self.connected,
                 "jsonFramesCount": len(self.json_frames),
                 "totalBytes": self.total_bytes,
-                "uptime": (datetime.datetime.now() - self.start_time).total_seconds() if self.start_time else 0,
+                "uptime": (datetime.datetime.now() - self.session_start_time).total_seconds() if self.session_start_time else 0,
                 "ports": [p.device for p in serial.tools.list_ports.comports()],
                 "logDir": LOG_DIR,
                 "wifiConsoleEnabled": self.wifi_console_enabled,
@@ -705,6 +1137,13 @@ class TinyGSServer:
                 "wifiConsoleLines": self.wifi_console_lines_received,
                 "wifiConsoleError": self.wifi_console_last_error,
                 "wifiConsoleErrorCount": self.wifi_console_consecutive_errors,
+                "gitVersion": GIT_VERSION,
+                "wifiConsoleHasSavedPassword": bool(self.wifi_console_password),
+                "watchdogEnabled": self.watchdog_enabled,
+                "watchdogSilenceHours": self.watchdog_silence_hours,
+                "lastFrameSeen": self.last_frame_seen.isoformat(),
+                "lastReset": self.last_reset.isoformat() if self.last_reset else None,
+                "resetHistory": list(self.reset_history),
             }
 
 
@@ -830,6 +1269,24 @@ async def websocket_handler(request):
                         try: await c.send_json({"type": "status", "data": status})
                         except: pass
 
+                elif action == "resetBoard":
+                    # reset_board() broadcasts status to all clients itself
+                    # (covers both this manual path and automatic
+                    # watchdog-triggered resets) - just send the result
+                    # back to the caller here.
+                    result = await server.reset_board("manual button press", manual=True)
+                    await ws.send_json({"type": "result", "data": result})
+
+                elif action == "setWatchdogConfig":
+                    result = await server.set_watchdog_config(
+                        data.get("enabled", False), data.get("silenceHours", 18)
+                    )
+                    await ws.send_json({"type": "result", "data": result})
+                    status = await server.get_status()
+                    for c in server.clients:
+                        try: await c.send_json({"type": "status", "data": status})
+                        except: pass
+
             except Exception as e:
                 await ws.send_json({"type": "error", "data": str(e)})
 
@@ -871,6 +1328,16 @@ async def index_handler(request):
       display: flex;
       align-items: center;
       gap: 10px;
+    }
+    .version-tag {
+      font-size: 11px;
+      font-weight: 400;
+      font-family: "Ubuntu Mono", monospace;
+      color: #666680;
+      background: #1a1a28;
+      padding: 2px 8px;
+      border-radius: 4px;
+      cursor: help;
     }
     .status {
       display: flex;
@@ -1226,7 +1693,7 @@ async def index_handler(request):
 </head>
 <body>
   <div class="header">
-    <h2>🛰️ TinyGS Serial Dashboard</h2>
+    <h2>🛰️ TinyGS Serial Dashboard <span class="version-tag" title="Git commit of the currently running server code - use this to confirm an upgrade/restart actually picked up your latest changes">__GIT_VERSION__</span></h2>
     <div class="status">
       <div class="status-dot" id="statusDot"></div>
       <span id="statusText">Disconnected</span>
@@ -1283,6 +1750,9 @@ async def index_handler(request):
     </button>
     <button id="btnWifiConsole" onclick="openWifiConsoleModal()">
       <span>🌐</span> WiFi Console
+    </button>
+    <button id="btnWatchdog" onclick="openWatchdogModal()">
+      <span>🐕</span> Watchdog
     </button>
   </div>
 
@@ -1362,6 +1832,10 @@ async def index_handler(request):
           firmware rejects unauthenticated requests, which is why this field
           is required, not optional.
         </p>
+        <p id="wifiConsoleSavedHint" style="display:none; color:#4ade80; font-size:12px; margin-bottom:10px;">
+          🔑 Using a previously saved IP/password - leave fields blank to
+          reuse them, or fill in new values to update.
+        </p>
         <div id="wifiConsoleIdleForm">
           <input id="wifiConsoleIpInput" placeholder="ESP32 IP address, e.g. 192.168.113.210" style="margin-bottom:10px;">
           <input id="wifiConsolePasswordInput" type="password" placeholder="Admin/AP password" style="margin-bottom:10px;">
@@ -1375,6 +1849,59 @@ async def index_handler(request):
           <p id="wifiConsoleErrorLine" style="display:none; color:#f87171; font-size:12px; margin-top:-8px;"></p>
           <button class="danger" onclick="stopWifiConsole()">Stop Polling</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="watchdogModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>🐕 Watchdog</h3>
+        <button class="modal-close" onclick="closeWatchdogModal()">✕</button>
+      </div>
+      <div class="modal-body" style="padding: 16px;">
+        <p style="color:#a0a0b8; font-size:13px; line-height:1.5; margin-bottom:14px;">
+          Hard-resets the board (RTS pulse over the already-open serial
+          connection, same technique esptool uses) if it looks stalled.
+          Two independent triggers, either fires a reset: no telemetry
+          frame decoded for longer than your silence timeout below, or -
+          if a WiFi Console IP is configured - that endpoint failing to
+          respond for several checks in a row (a faster, stronger sign
+          the board itself has actually hung).
+        </p>
+        <p style="color:#f0b429; font-size:12px; line-height:1.5; margin-bottom:14px;">
+          ⚠ Set the silence timeout well past your normal gap between
+          passes - a too-short timeout will reset a perfectly healthy,
+          just-quiet receiver.
+        </p>
+
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+          <label style="display:flex; align-items:center; gap:6px; font-size:13px;">
+            <input type="checkbox" id="watchdogEnabledInput" onchange="saveWatchdogConfig()">
+            Enable automatic watchdog
+          </label>
+        </div>
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:16px;">
+          <label style="font-size:13px; color:#a0a0b8;">Silence timeout (hours)</label>
+          <input type="number" id="watchdogSilenceInput" min="1" step="1" style="width:80px;"
+                 onchange="saveWatchdogConfig()">
+        </div>
+
+        <p style="font-size:13px; margin-bottom:4px;">
+          Last telemetry frame: <span id="watchdogLastFrame">-</span>
+        </p>
+        <p style="font-size:13px; margin-bottom:16px;">
+          Last reset: <span id="watchdogLastReset">never</span>
+        </p>
+
+        <button class="danger" onclick="resetBoardNow()">⚡ Reset Board Now</button>
+
+        <h4 style="margin-top:20px; margin-bottom:8px; font-size:13px; color:#a0a0b8;">Reset History</h4>
+        <table id="watchdogHistoryTable" style="width:100%; font-size:12px; border-collapse:collapse;">
+          <tbody id="watchdogHistoryBody">
+            <tr><td style="color:#a0a0b8; padding:6px 0;">No resets yet</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -1454,11 +1981,16 @@ async def index_handler(request):
       document.getElementById('wifiConsoleModal').classList.remove('show');
     }
 
+    let wifiConsoleHasSavedPassword = false;
+
     function startWifiConsole() {
       const ip = document.getElementById('wifiConsoleIpInput').value.trim();
       const password = document.getElementById('wifiConsolePasswordInput').value;
       if (!ip) { showToast('Enter an IP address first'); return; }
-      if (!password) { showToast('Enter the admin/AP password - the firmware requires it'); return; }
+      if (!password && !wifiConsoleHasSavedPassword) {
+        showToast('Enter the admin/AP password - the firmware requires it');
+        return;
+      }
       sendAction('startWifiConsole', {ip, password});
     }
 
@@ -1472,6 +2004,20 @@ async def index_handler(request):
       const btn = document.getElementById('btnWifiConsole');
       const statusLine = document.getElementById('wifiConsoleStatusLine');
       const errorLine = document.getElementById('wifiConsoleErrorLine');
+      const savedHint = document.getElementById('wifiConsoleSavedHint');
+      const ipInput = document.getElementById('wifiConsoleIpInput');
+
+      wifiConsoleHasSavedPassword = !!state.wifiConsoleHasSavedPassword;
+
+      // Pre-fill the IP field from a previous session (server-persisted -
+      // see CONFIG_FILE), but only if the user hasn't already typed
+      // something themselves, so we don't clobber active typing on every
+      // state update.
+      if (state.wifiConsoleIp && !ipInput.value && document.activeElement !== ipInput) {
+        ipInput.value = state.wifiConsoleIp;
+      }
+      savedHint.style.display = (wifiConsoleHasSavedPassword && !state.wifiConsoleEnabled) ? 'block' : 'none';
+
       if (state.wifiConsoleEnabled) {
         idleForm.style.display = 'none';
         activeInfo.style.display = 'block';
@@ -1495,6 +2041,78 @@ async def index_handler(request):
         btn.classList.remove('danger');
       }
     }
+
+    function openWatchdogModal() {
+      document.getElementById('watchdogModal').classList.add('show');
+    }
+
+    function closeWatchdogModal() {
+      document.getElementById('watchdogModal').classList.remove('show');
+    }
+
+    function formatRelativeTime(iso) {
+      if (!iso) return '-';
+      const ms = Date.now() - new Date(iso).getTime();
+      const mins = Math.floor(ms / 60000);
+      if (mins < 1) return 'just now';
+      if (mins < 60) return `${mins}m ago`;
+      const hrs = Math.floor(mins / 60);
+      if (hrs < 48) return `${hrs}h ago`;
+      return `${Math.floor(hrs / 24)}d ago`;
+    }
+
+    function saveWatchdogConfig() {
+      const enabled = document.getElementById('watchdogEnabledInput').checked;
+      const silenceHours = parseFloat(document.getElementById('watchdogSilenceInput').value) || 18;
+      sendAction('setWatchdogConfig', {enabled, silenceHours});
+    }
+
+    function resetBoardNow() {
+      if (!isConnected) {
+        showToast('Not connected - open the serial connection first');
+        return;
+      }
+      if (!confirm('Hard-reset the board now?')) return;
+      sendAction('resetBoard');
+    }
+
+    // Tracks whether the user is actively editing the config inputs, so an
+    // incoming status update (e.g. from another browser tab, or the
+    // watchdog's own periodic broadcasts) doesn't clobber a value they're
+    // mid-typing - same pattern as the WiFi Console IP field above.
+    function updateWatchdogUI(state) {
+      const enabledInput = document.getElementById('watchdogEnabledInput');
+      const silenceInput = document.getElementById('watchdogSilenceInput');
+
+      if (document.activeElement !== enabledInput) {
+        enabledInput.checked = !!state.watchdogEnabled;
+      }
+      if (document.activeElement !== silenceInput) {
+        silenceInput.value = state.watchdogSilenceHours ?? 18;
+      }
+
+      document.getElementById('watchdogLastFrame').textContent =
+        state.lastFrameSeen ? `${formatRelativeTime(state.lastFrameSeen)} (${new Date(state.lastFrameSeen).toLocaleString()})` : '-';
+      document.getElementById('watchdogLastReset').textContent =
+        state.lastReset ? `${formatRelativeTime(state.lastReset)} (${new Date(state.lastReset).toLocaleString()})` : 'never';
+
+      const body = document.getElementById('watchdogHistoryBody');
+      const history = state.resetHistory || [];
+      if (history.length === 0) {
+        body.innerHTML = '<tr><td style="color:#a0a0b8; padding:6px 0;">No resets yet</td></tr>';
+      } else {
+        body.innerHTML = history.map(h => `
+          <tr>
+            <td style="padding:4px 8px 4px 0; white-space:nowrap; color:#a0a0b8;">${new Date(h.time).toLocaleString()}</td>
+            <td style="padding:4px 0;">${h.reason}${h.manual ? ' <span style="color:#4ade80;">(manual)</span>' : ''}</td>
+          </tr>
+        `).join('');
+      }
+    }
+
+    document.getElementById('watchdogModal').addEventListener('click', (e) => {
+      if (e.target.id === 'watchdogModal') closeWatchdogModal();
+    });
 
     async function openLogViewer(encodedName) {
       const name = decodeURIComponent(encodedName);
@@ -1576,12 +2194,19 @@ async def index_handler(request):
       // Re-derive the anchor every time we get a fresh reading from the
       // server, so the local ticker (below) stays in sync and self-corrects
       // for any client/server clock drift rather than accumulating error.
-      uptimeAnchor = state.connected ? (Date.now() - state.uptime * 1000) : null;
+      // A session is "active" for UPTIME purposes if EITHER serial OR WiFi
+      // Console is connected - originally this only checked state.connected
+      // (serial), so UPTIME stayed frozen at 00:00:00 for anyone running
+      // WiFi Console without a serial connection, despite a real session
+      // genuinely being active server-side (see session_start_time).
+      const sessionActive = state.connected || state.wifiConsoleEnabled;
+      uptimeAnchor = sessionActive ? (Date.now() - state.uptime * 1000) : null;
       document.getElementById('portInfo').textContent = state.connected ? 'Streaming...' : 'No port selected';
       document.getElementById('termTitle').textContent = state.connected ? 'serial://active @ 115200' : 'serial://waiting';
 
       updatePortList(state.ports);
       updateWifiConsoleUI(state);
+      updateWatchdogUI(state);
 
       btnConnect.innerHTML = state.connected ? '<span>⏹</span> Disconnect' : '<span>▶</span> Connect';
       btnConnect.classList.toggle('danger', state.connected);
@@ -1726,6 +2351,7 @@ async def index_handler(request):
   </script>
 </body>
 </html>'''
+    html = html.replace('__GIT_VERSION__', GIT_VERSION)
     return web.Response(text=html, content_type='text/html')
 
 
@@ -1735,6 +2361,21 @@ async def on_startup(app):
     server.loop = asyncio.get_event_loop()
     t = threading.Thread(target=server.serial_reader, daemon=True)
     t.start()
+
+    # Auto-resume WiFi Console polling if it was active when the server last
+    # stopped (restart/upgrade) - see the credential-persistence comment in
+    # TinyGSServer.__init__. Entirely automatic; no browser interaction
+    # needed. Only attempted if we actually have both an IP and password
+    # saved (a corrupt/partial config file just means this silently doesn't
+    # auto-resume, same as never having enabled it).
+    if server._wifi_console_should_resume and server.wifi_console_ip and server.wifi_console_password:
+        await server.start_wifi_console(server.wifi_console_ip, server.wifi_console_password)
+
+    # Watchdog runs continuously for the process lifetime (unlike WiFi
+    # Console's task, which is started/stopped on demand) - it's a no-op on
+    # every check while server.watchdog_enabled is False, so there's no
+    # need to tear it down and recreate it when toggled from the UI.
+    server._watchdog_task = asyncio.create_task(server._watchdog_loop())
 
 
 app = web.Application()
@@ -1748,6 +2389,7 @@ app.on_startup.append(on_startup)
 if __name__ == '__main__':
     print("=" * 55)
     print("🛰️  TinyGS Dashboard Server")
+    print(f"Version: {GIT_VERSION}")
     print("=" * 55)
     print("Open http://localhost:5000 in your browser")
     print("Logs saved to: " + LOG_DIR)

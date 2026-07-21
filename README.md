@@ -12,6 +12,7 @@ A live web dashboard for monitoring TinyGS ESP32 ground station serial output on
 - Saves **two** log files per session to disk (see "Log Files" below)
 - Lets you browse and view saved log files right from the dashboard (📂 Logs button)
 - Extracts and exports parsed JSON telemetry frames separately
+- Optional watchdog: hard-resets the board if it stops decoding telemetry or its web panel stops responding (see "Watchdog" below)
 - Works from any device on your network, not just the machine it's running on
 
 ## Quick Start
@@ -135,6 +136,7 @@ Browse and view any of these files without leaving the browser via the 📂
 | **Filters** | View All / JSON / TX / RX / Errors only |
 | **📂 Logs** | Browse and view any saved log file (processed or raw) without leaving the browser |
 | **🌐 WiFi Console** | Polls the ESP32's own local web dashboard over WiFi for guaranteed-complete console text (bypasses the USB serial buffer limit entirely - see below) |
+| **🐕 Watchdog** | Hard-resets the board over serial if telemetry goes silent too long, or its web panel stops responding - see below |
 | **Export JSON** | Download all parsed telemetry frames as `.json` |
 | **Clear** | Reset terminal and counters |
 | **Dark theme** | Easy on the eyes for long monitoring sessions |
@@ -174,6 +176,88 @@ distinction also carries through to exported JSON telemetry - every frame
 in `frames_*.json` has a `_source` field (`"serial"` or `"wifi"`) so you can
 tell, even after the fact, which connection a given decoded packet came
 through.
+
+**Credentials persist across restarts.** Once you've entered your IP and
+password successfully, they're saved to `~/tinygs-dashboard/config.json`
+(permissions locked to owner-only) - a server restart or `git pull` +
+upgrade won't make you re-enter them. If WiFi Console was actively polling
+when the server last stopped (a crash or restart, not a deliberate "Stop
+Polling" click), it **automatically resumes on the next startup**, with no
+browser interaction needed at all.
+
+**Security note:** the password is stored in plaintext on disk, protected
+only by OS file permissions (`chmod 600`), not encrypted. This is a
+deliberate convenience tradeoff intended for a personal, single-user
+machine. If that doesn't describe your setup, either don't use this feature
+(re-enter the password each session instead) or delete/edit
+`~/tinygs-dashboard/config.json` directly.
+
+## Watchdog
+
+Ground stations left running unattended can occasionally stop decoding
+telemetry silently - no crash, no error, the board just stops hearing
+passes - and need a power cycle to recover. The **🐕 Watchdog** panel
+automates that recovery instead of requiring someone to notice and
+manually reset the board.
+
+**Two independent triggers, either one fires a reset:**
+
+1. **No telemetry frame decoded for longer than your configured silence
+   timeout.** This is the main, slower-acting check. There's no universally
+   correct default - it depends entirely on how often satellites actually
+   pass over your station - so set it comfortably past your normal gap
+   between passes. A too-short timeout will reset a perfectly healthy,
+   just-quiet receiver.
+2. **The WiFi Console IP (if you've set one up - see above) stops
+   responding for several checks in a row.** This is a faster, stronger
+   signal that the board itself has actually hung (its whole network/task
+   stack, not just the radio), independent of whether a satellite happens
+   to be overhead at that moment.
+
+**How the reset works:** a brief RTS pulse over the already-open serial
+connection, with DTR held low throughout - the same technique `esptool`
+itself uses for a "hard reset," as opposed to a bootloader/download-mode
+entry. This requires an external USB-serial bridge chip (CP2102, CH340,
+FT232, etc.) wired to the ESP32's `EN`/`IO0` pins via the standard
+auto-reset circuit found on most dev boards; it does **not** work over a
+chip's native USB (e.g. some ESP32-S3/C3 boards), since those don't expose
+real hardware DTR/RTS control lines to the ESP32's reset circuit the same
+way.
+
+**After a reset, the dashboard automatically reconnects** once the board
+comes back on USB - even if it re-enumerates under a different
+`/dev/ttyUSB*`/`/dev/ttyACM*` path than it had before, since a reboot can
+occasionally cause that on a host with other USB-serial devices attached.
+It watches for up to 30 seconds; if the board hasn't reappeared by then,
+it logs a clear warning rather than silently retrying forever, since at
+that point something beyond ordinary USB re-enumeration delay (bad cable,
+powered-off hub port, or a reset that didn't actually take) is the more
+likely explanation.
+
+**Manual reset:** the same **Reset Board Now** button in the panel works
+regardless of whether the automatic watchdog is enabled - useful for
+testing that a reset actually works on your specific hardware before
+trusting the unattended version, or just as a quick manual power-cycle
+button you don't need physical access to the board for.
+
+**Settings persist across restarts**, saved to the same
+`~/tinygs-dashboard/config.json` used by WiFi Console (see above) - a
+restart or `git pull` + upgrade won't reset your configured timeout back
+to default or silently re-disable it if you had it on.
+
+**Off by default.** Turning it on with an untuned timeout risks resetting
+a healthy receiver during a normal quiet stretch between passes - enable
+it and set the silence timeout from the panel once you know your own
+station's typical pass cadence.
+
+## Version Display
+
+The page header shows a small tag with the currently-running server code's
+git commit hash (e.g. `a1b2c3d`, or `a1b2c3d-dirty` if there are uncommitted
+local changes). Also printed in the server's startup console banner. Use
+this to confirm a `git pull` + restart actually picked up your latest
+changes - "unknown" means the code isn't running from a git checkout (e.g.
+you're running from an extracted zip rather than a clone).
 
 ## Known/Accepted Behavior
 

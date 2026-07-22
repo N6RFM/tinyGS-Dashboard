@@ -109,11 +109,49 @@ it came from - see "WiFi Console" below.
 Browse and view any of these files without leaving the browser via the 📂
 **Logs** button in the dashboard toolbar.
 
+## Utility Scripts
+
+**`parse_telemetry.py`** extracts telemetry frames (the 60-byte hex packets)
+out of one or more saved WiFi Console logs, tags each with its UTC capture
+timestamp, and drops duplicates - useful if you've pulled several
+overlapping `stream_*.log` files (e.g. from re-polling before a gap in
+coverage) and want one clean, chronological list of unique packets rather
+than manually cross-referencing them.
+
+```bash
+python3 parse_telemetry.py stream_20260722T120000Z.log
+# or across several overlapping logs at once:
+python3 parse_telemetry.py stream_*.log
+```
+
+Output goes to stdout as `<UTC timestamp>` followed by the packet's hex
+bytes on the next line, one frame per blank-line-separated block - pipe or
+redirect it if you want it saved:
+```bash
+python3 parse_telemetry.py stream_*.log > frames.txt
+```
+Progress/summary info (how many frames found per file, how many duplicates
+were dropped) goes to stderr instead, so it won't clutter piped output.
+
+**How duplicates are detected:** by exact UTC timestamp match, not by
+comparing packet contents. In the extremely unlikely case that two
+genuinely different packets were logged with the identical millisecond
+timestamp, the second would be dropped - a narrow theoretical edge case
+given real capture timestamps have natural jitter, not something addressed
+by this tool as written.
+
+**Note:** this only looks for `[WiFi]`-tagged packet blocks (matching the
+WiFi Console's log format specifically) - it won't pick up hex dumps from
+plain USB serial logs, which can be truncated by the firmware's Serial
+buffer limit anyway (see "Known/Accepted Behavior" below) and so aren't a
+reliable source for this kind of complete-frame extraction to begin with.
+
 ## File Layout
 
 ```
 ~/tinyGS-Dashboard/
 ├── tinygs_server.py      # Main server (single file: backend + inline HTML/JS/CSS frontend)
+├── parse_telemetry.py    # Standalone utility: extract/dedupe telemetry frames from saved logs
 ├── requirements.txt      # Python dependencies
 ├── venv/                 # Python virtual environment (created by install.sh, gitignored)
 ├── logs/                 # Auto-created (contents gitignored, folder itself tracked via .gitkeep)

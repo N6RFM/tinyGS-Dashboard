@@ -6,7 +6,7 @@ A live web dashboard for monitoring TinyGS ESP32 ground station serial output on
 
 ## What it does
 
-- Connects to your ESP32 via USB serial (auto-detects CP2102, CH340, FT232, native USB chips)
+- Connects to your ESP32 via USB serial (auto-detects CP2102, CH340, native USB chips by their actual USB vendor/product ID)
 - Displays live LoRa frame data in a web browser, with color-coded terminal output
 - Filters by event type (All / JSON / TX / RX / Errors)
 - Saves **two** log files per session to disk (see "Log Files" below)
@@ -122,6 +122,7 @@ Browse and view any of these files without leaving the browser via the 📂
 │   └── frames_YYYYMMDDTHHMMSSZ.json   # Exported JSON telemetry frames
 ├── install.sh             # Installer (creates venv, installs deps, sets up dialout group)
 ├── install_service.sh     # Optional: installs as a systemd service for auto-start on boot
+├── config.json            # WiFi Console credentials, Watchdog settings, remembered device - gitignored (see "Security note" under WiFi Console above)
 ├── LICENSE                # MIT
 └── .gitignore
 ```
@@ -131,7 +132,7 @@ Browse and view any of these files without leaving the browser via the 📂
 | Feature | Description |
 |---------|-------------|
 | **Connect/Disconnect** | One-click serial port control |
-| **Auto-detect** | Finds CP2102, CH340, FT232, native USB ESP32s |
+| **Auto-detect** | Finds CP2102, CH340, native USB ESP32s by USB vendor/product ID - see below |
 | **Live meters** | Frame count, bytes, JSON objects, uptime |
 | **Filters** | View All / JSON / TX / RX / Errors only |
 | **📂 Logs** | Browse and view any saved log file (processed or raw) without leaving the browser |
@@ -140,6 +141,34 @@ Browse and view any of these files without leaving the browser via the 📂
 | **Export JSON** | Download all parsed telemetry frames as `.json` |
 | **Clear** | Reset terminal and counters |
 | **Dark theme** | Easy on the eyes for long monitoring sessions |
+
+## Auto-detect
+
+Auto-detect matches connected USB devices by their actual **USB vendor:product
+ID** (`10c4:ea60` for Silicon Labs CP2102, `1a86:7523` for CH340, plus
+Espressif's own native-USB IDs for boards without a separate bridge chip) -
+not by scanning the human-readable description text for words like "CP210x"
+or "serial", which is far less reliable.
+
+**FT232 is deliberately excluded**, even though it's a common USB-serial
+chip on plenty of other hardware. It isn't actually characteristic of ESP32
+dev boards specifically (CP2102/CH340/native-USB dominate that space), and
+including it caused a real problem in practice: FT232 is *very* common in
+ham radio gear generally - rotor controllers and CAT interfaces frequently
+use it - so a station with one of those connected alongside the ESP32 could
+have Auto-detect pick the wrong device entirely, non-deterministically,
+each time it (re)connected. If you have an FT232-based ESP32 board
+specifically (uncommon, but not impossible), select its exact port from the
+dropdown instead of relying on Auto-detect.
+
+**If more than one device matches** (e.g. two different CP2102-based
+gadgets connected at once), Auto-detect remembers which exact device
+actually worked on your last successful connection (saved to
+`~/tinygs-dashboard/config.json`, same as WiFi Console credentials) and
+prefers that one specifically on future attempts, rather than gambling on
+whichever one the OS happens to enumerate first. This matters most for the
+Watchdog's automatic reconnect-after-reset, which calls Auto-detect
+repeatedly in the background with no one watching to correct a wrong guess.
 
 ## WiFi Console
 
@@ -212,7 +241,15 @@ manually reset the board.
    responding for several checks in a row.** This is a faster, stronger
    signal that the board itself has actually hung (its whole network/task
    stack, not just the radio), independent of whether a satellite happens
-   to be overhead at that moment.
+   to be overhead at that moment. This check requests the same lightweight
+   `/cs` endpoint the WiFi Console poller itself uses - an earlier version
+   requested the full config dashboard page instead, which is heavy enough
+   to generate on the ESP32 (hundreds of inline SVG elements, several
+   live-updating tables) that it could reliably exceed the check's timeout
+   on a perfectly healthy board. If you ever see resets recurring at a
+   suspiciously exact, clockwork interval (as opposed to varying with
+   actual conditions), that mismatched-endpoint bug is the first thing to
+   suspect - update to the latest version if so.
 
 **How the reset works:** a brief RTS pulse over the already-open serial
 connection, with DTR held low throughout - the same technique `esptool`
@@ -222,7 +259,10 @@ FT232, etc.) wired to the ESP32's `EN`/`IO0` pins via the standard
 auto-reset circuit found on most dev boards; it does **not** work over a
 chip's native USB (e.g. some ESP32-S3/C3 boards), since those don't expose
 real hardware DTR/RTS control lines to the ESP32's reset circuit the same
-way.
+way. (Note: this is about what the *reset mechanism* needs electrically,
+not about which chips Auto-detect will find automatically - see
+"Auto-detect" above. An FT232-based board can still use this reset
+feature; you'd just need to select its port manually first.)
 
 **After a reset, the dashboard automatically reconnects** once the board
 comes back on USB - even if it re-enumerates under a different
@@ -332,6 +372,20 @@ tinygs.com is complete regardless of what the local serial console shows.
     show you the PID; close that program before connecting from the dashboard.
   - **The systemd service AND a manual instance both running** - see the
     "Auto-Start on Boot" section above.
+
+**Auto-detect connects to the wrong device, or fails when it used to work**
+- See "Auto-detect" above for how device matching actually works. If you
+  have other USB-serial gear connected (rotor controllers, CAT interfaces,
+  Arduino boards), check what Auto-detect sees:
+  ```
+  python3 -c "
+  import serial.tools.list_ports
+  for p in serial.tools.list_ports.comports():
+      print(p.device, p.description, hex(p.vid) if p.vid else None, hex(p.pid) if p.pid else None)
+  "
+  ```
+- If nothing shows a recognized ESP32 vendor/product ID (see "Auto-detect"
+  above), select your board's exact port from the dropdown instead.
 
 **Port keeps disconnecting (unrelated to the above)**
 - Check USB cable (some cables are power-only, no data lines)

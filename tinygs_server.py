@@ -311,6 +311,14 @@ class TinyGSServer:
         self.wifi_console_lines_received = 0
         self.wifi_console_last_error = None
         self.wifi_console_consecutive_errors = 0
+        # Remembered from the last time connect_serial() actually succeeded
+        # (auto-detect or manual) - see the "preferred" logic in
+        # connect_serial() for why: with more than one plausible USB-serial
+        # candidate present (a very normal situation in a multi-device ham
+        # radio setup), this lets auto-detect self-correct to whichever
+        # device is proven to actually work, rather than re-gambling among
+        # equally-plausible candidates every single time.
+        self.last_connected_vid_pid = _saved.get("last_connected_vid_pid")
         # Tracks whether a "poll failed" warning was actually logged for the
         # CURRENT failure streak - isolated single-attempt blips (WiFi jitter,
         # the embedded server being briefly busy) are extremely common over
@@ -588,16 +596,68 @@ class TinyGSServer:
             return {"ok": True, "message": "Already connected"}
 
         if port is None or port == "Auto-detect":
-            ports = [p.device for p in serial.tools.list_ports.comports()]
-            # Prefer common ESP32 USB chips
-            preferred = []
-            for p in serial.tools.list_ports.comports():
-                if any(x in p.description.lower() for x in ['cp210', 'ch340', 'ft232', 'usb-serial', 'uart']):
-                    preferred.append(p.device)
-            ports = preferred + [p for p in ports if p not in preferred]
-            if not ports:
-                return {"ok": False, "error": "No serial ports found. Is the ESP32 plugged in?"}
-            port = ports[0]
+            # Known USB-serial bridge chip VID:PID pairs commonly used on
+            # ESP32 dev boards, plus Espressif's own native-USB VID for
+            # boards using the chip's built-in USB-CDC instead of a bridge
+            # chip. Matching on VID:PID (officially registered identifiers)
+            # rather than the previous approach - a loose substring check
+            # against the human-readable description ('cp210', 'ch340',
+            # 'ft232', 'usb-serial', 'uart') - because those are extremely
+            # common, generic chip families used in a huge range of
+            # unrelated devices (Arduino boards, radio CAT interfaces,
+            # rotor controllers...). That looseness was a real risk: if
+            # another connected device happened to share one of those
+            # chips, auto-detect could pick IT instead of the ESP32 -
+            # concerning given _reconnect_after_reset() calls this same
+            # auto-detect path every second for up to 30s after every
+            # watchdog reset, repeatedly gambling on picking the right
+            # port.
+            #
+            # FT232 deliberately excluded: proven in practice (not just in
+            # theory) to cause exactly this ambiguity - a real user had two
+            # separate FT232-based devices (a rotor controller / CAT
+            # interface) alongside their actual CP2102-based ESP32 board,
+            # and since FT232 isn't actually characteristic of ESP32 boards
+            # specifically (CP2102/CH340/native-USB dominate that space),
+            # including it bought no real benefit while creating a genuine
+            # false-match risk in any multi-device ham-radio setup - which
+            # is a very normal setup for this dashboard's actual users.
+            KNOWN_ESP32_VID_PIDS = {
+                (0x10C4, 0xEA60),  # Silicon Labs CP2102/CP2102N
+                (0x1A86, 0x7523),  # QinHeng CH340
+                (0x303A, 0x1001),  # Espressif native USB-CDC (ESP32-S2/S3/C3)
+                (0x303A, 0x0002),  # Espressif native USB-JTAG/serial
+            }
+            candidates = [
+                p for p in serial.tools.list_ports.comports()
+                if p.vid is not None and (p.vid, p.pid) in KNOWN_ESP32_VID_PIDS
+            ]
+            if not candidates:
+                return {
+                    "ok": False,
+                    "error": (
+                        "No ESP32-like device found (matched by known USB "
+                        "vendor/product ID, not just any USB-serial adapter). "
+                        "Is the board plugged in? If it's connected but still "
+                        "not detected, select its exact port from the "
+                        "dropdown instead of Auto-detect."
+                    ),
+                }
+            # Even with a tightened VID:PID allowlist, more than one
+            # candidate can still legitimately match (e.g. two different
+            # CP2102-based boards, or a second device that happens to share
+            # a chip family with the real board). Rather than picking
+            # whichever one the OS happens to enumerate first each time
+            # (non-deterministic, and can silently connect to the wrong
+            # device), remember which exact VID:PID actually worked on the
+            # last successful connect (self.last_connected_vid_pid,
+            # persisted to CONFIG_FILE - see _load_config in __init__) and
+            # prefer that one specifically if it's among the candidates.
+            preferred = [
+                p for p in candidates
+                if self.last_connected_vid_pid and (p.vid, p.pid) == tuple(self.last_connected_vid_pid)
+            ]
+            port = (preferred[0] if preferred else candidates[0]).device
 
         try:
             # IMPORTANT: pyserial's Serial(port, baud, ...) constructor opens the
@@ -640,6 +700,20 @@ class TinyGSServer:
             self.start_time = datetime.datetime.now()
             self._refresh_session_start_time()
             self.log(f"Connected to {port} @ {BAUD_RATE} baud", "success")
+
+            # Remember this device's VID:PID for future auto-detect
+            # preference (see the "preferred" logic above) - looked up by
+            # matching the connected port path against the current port
+            # list, since pyserial's own Serial object doesn't expose
+            # VID/PID after opening. Best-effort: if the port isn't found
+            # in the list for any reason (race with a replug, etc.) this
+            # just silently skips remembering it rather than failing the
+            # connection over a non-essential convenience feature.
+            for p in serial.tools.list_ports.comports():
+                if p.device == port and p.vid is not None:
+                    self.last_connected_vid_pid = [p.vid, p.pid]
+                    _save_config({"last_connected_vid_pid": [p.vid, p.pid]})
+                    break
 
             # Diagnostic: log the actual read-back modem control line state.
             # `stty -a` cannot show this at all (it only reports termios line
@@ -923,20 +997,40 @@ class TinyGSServer:
 
     async def _check_wifi_panel_alive(self):
         """One-shot liveness check against the WiFi Console IP's web
-        server (the same board, same endpoint a browser would hit at its
-        IP). Independent of whether WiFi Console polling is actually
-        turned on - only the IP needs to be known/saved. Uses its own
-        short-lived session (not the WiFi Console poller's persistent one)
-        since this runs on a much slower cadence and shouldn't be tangled
-        up with that loop's error-streak bookkeeping."""
+        server. Independent of whether WiFi Console polling is actually
+        turned on - only the IP and password need to be known/saved. Uses
+        its own short-lived session (not the WiFi Console poller's
+        persistent one) since this runs on a much slower cadence and
+        shouldn't be tangled up with that loop's error-streak bookkeeping.
+
+        Hits /cs (the same lightweight console-log-tail endpoint
+        _wifi_console_poll_loop() uses, proven reliable over many hours of
+        continuous polling in production) rather than / (the full config
+        dashboard page). An earlier version of this check requested / and
+        caused a clockwork false-positive reset roughly every 9 minutes,
+        every time, on an otherwise perfectly healthy board - traced to
+        that page being heavy to generate on the ESP32 (hundreds of inline
+        SVG elements, several live-updating tables), reliably exceeding
+        the 5s timeout regardless of actual board health. /cs is a tiny
+        incremental text fetch and has never shown that failure mode.
+
+        Also sends the same HTTP Basic Auth the WiFi Console poller uses
+        (required by handleRefreshConsole() in the firmware's
+        ConfigManager.cpp) - without it every request would get a 401,
+        which the strict `resp.status == 200` check below correctly
+        treats as "can't confirm alive", so a missing/wrong password no
+        longer masquerades as a healthy check passing by accident."""
         if not self.wifi_console_ip:
             return None  # no IP known - this trigger just can't be evaluated
+        if not self.wifi_console_password:
+            return None  # no password known - can't authenticate, can't evaluate
         try:
+            auth_header = {"Authorization": aiohttp.encode_basic_auth("admin", self.wifi_console_password)}
             connector = aiohttp.TCPConnector(force_close=True)
-            async with aiohttp.ClientSession(connector=connector) as session:
+            async with aiohttp.ClientSession(headers=auth_header, connector=connector) as session:
                 timeout = aiohttp.ClientTimeout(total=5)
-                async with session.get(f"http://{self.wifi_console_ip}/", timeout=timeout) as resp:
-                    return resp.status < 500
+                async with session.get(f"http://{self.wifi_console_ip}/cs?c2=0", timeout=timeout) as resp:
+                    return resp.status == 200
         except Exception:
             return False
 
